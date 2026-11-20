@@ -36,6 +36,13 @@ Runs on Windows 10 and 11 with WSL 2, and offers to turn that on if it's missing
 - **Every shell color.** All six finishes, in a window you can resize freely.
 - **AI agent control.** Let your coding agent drive the player and see the results.
 
+<p align="center">
+  <img src="docs/window.png" width="230" alt="The emulator window with a firmware running">
+  <img src="docs/window-more.png" width="230" alt="The More menu: shell colors, capture options, AI agent control">
+  <img src="docs/window-screen-off.png" width="230" alt="Recording while the player's screen is off">
+</p>
+<p align="center"><em>The emulator window: a firmware running, the More menu, and recording while the player's screen is off.</em></p>
+
 Not available yet: real-time playback with sound, and Wi-Fi and Bluetooth connections with their settings. A song can open in Now Playing but won't show track progress.
 
 Build from source, connect an AI agent, or see how it works: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Licensed under GPL v3.
