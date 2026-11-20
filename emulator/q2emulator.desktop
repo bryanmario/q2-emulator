@@ -1,0 +1,9 @@
+# Read by WSL's display, which takes the taskbar icon of a Linux window from the entry whose StartupWMClass
+# is the window's class (emulator_gui.py: className). NoDisplay: no entry of its own in the Start menu.
+[Desktop Entry]
+Type=Application
+Name=Q2 Emulator
+Exec=python3 /opt/q2-emulator/emulator/emulator_gui.py
+Icon=/usr/share/pixmaps/q2emulator.png
+StartupWMClass=Q2emulator
+NoDisplay=true

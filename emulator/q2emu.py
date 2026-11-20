@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""Run the Q2's own firmware (stock or Q2 Pod) on a Linux PC and drive it.
+
+The firmware's rootfs is unpacked into a work folder and its programs run there unmodified under
+qemu-mipsel (chroot + binfmt_misc), with libq2emu.so (shim.c) preloaded to answer for the hardware:
+the framebuffer is a file, and the keys, touch panel and wheel are UNIX sockets this script writes input
+events to. Needs root, Linux, qemu-mipsel-static 11.1.3, squashfs-tools, clang and lld.
+
+  sudo python3 emulator/q2emu.py --firmware update.tar                 # a plain window to click
+  sudo python3 emulator/q2emu.py --firmware update.tar --script 'wait 8; wheel 2; key centre; wait 2; shot out.png'
+
+Script words: wait S | key NAME [MS] | wheel N | tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot FILE
+(keys: centre return play next prev; coordinates are the upright screen's, 375x320)."""
+import argparse, fcntl, hashlib, os, pathlib, shlex, shutil, signal, socket, struct, subprocess, sys, tarfile, threading, time, zipfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+XRES, YRES = 320, 375                      # the panel's own portrait frame; the screen is it turned upright
+EVENT = struct.Struct('<iiHHi')            # struct input_event, MIPS32
+EV_SYN, EV_KEY, EV_ABS, ABS_X, ABS_Y, ABS_PRESSURE, BTN_TOUCH = 0, 1, 3, 0, 1, 0x18, 0x14a
+KEYS = {'centre': 116, 'return': 103, 'play': 108, 'next': 163, 'prev': 165}
+DEVICES = {'keys': 'event1', 'touch': 'event2', 'wheel': 'event3', 'bt': 'event4'}
+WHEEL_TICK, WHEEL_STEP, SAMPLE_S = 28, 11, 0.02  # units a tick at 50% sensitivity; a sample's travel and period
+BINFMT = (r':q2mipsel:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x08\x00:'
+          r'\xff\xff\xff\xff\xff\xff\xff\x00\x00\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:{qemu}:F')
+# The DAC's PCMs, silent: alsa.conf loads alsa.conf.d before the Q2's own /mnt/data/asound.conf.
+# ponytail: a null PCM takes samples as fast as they are written, so a song's position runs ahead of the
+# clock; a PCM paced to its rate (a shim over snd_pcm_writei, or an ALSA "file" plugin behind a rate limit).
+ASOUND = '''pcm.!hw { @args [ CARD DEV SUBDEV ] @args.CARD { type string default "0" } @args.DEV { type integer default 0 } @args.SUBDEV { type integer default -1 } type null }
+pcm.!plughw { @args [ CARD DEV SUBDEV ] @args.CARD { type string default "0" } @args.DEV { type integer default 0 } @args.SUBDEV { type integer default -1 } type null }
+pcm.!default { type null }
+'''
+START = '''#!/bin/sh
+# What S90play does before demo, without the hardware's own steps.
+# This shell is PID 1 of the box, so it is also the Q2's init. The firmware's Restart (and a theme change,
+# which restarts) runs busybox reboot, and Power off runs poweroff: they signal PID 1 (SIGTERM; SIGUSR1 or
+# SIGUSR2) and then wait to be ended. So: a reboot ends everything else in the box and boots demo again,
+# in the same window; a power-off ends the box with status 0; demo ending by itself ends it with demo's
+# status (98 for a 0, so that 0 always means a power-off). Three reboots in a row, each within 20 s of
+# its boot, are a reboot loop, not a user's Restart: the box ends with status 97 instead of looping.
+export TSLIB_TSDEVICE=/dev/input/event2 TSLIB_CONFFILE=/etc/ts.conf TSLIB_PLUGINDIR=/usr/lib/ts
+export Q2EMU_DIR=/tmp/q2emu ${Q2EMU_TRACE_ALL:+QEMU_STRACE=1}
+mkdir -p /tmp/q2emu/cores && ulimit -c unlimited  # QEMU writes a guest core there when demo crashes
+trap 'want=reboot' TERM
+trap 'want=off' USR1 USR2
+fast=0
+while :; do
+    want= status=
+    rm -f /var/run/dbus/pid /var/run/dbus/system_bus_socket /tmp/q2emu/fb.pan /tmp/q2emu/fb.blank /tmp/q2emu/fb.drawn
+    # The loading screen, by the Q2's own boot step: the firmware's picture, or the user's own
+    # (/mnt/data/boot-logo.jpg). It stays up until demo draws. (Through env, and the name in a variable:
+    # prepare() puts demo's settings before the one place this script names the preload variable.)
+    p=LD_PRELOAD
+    [ -x /etc/init.d/S11logo_display_shell ] && env "$p"=/lib/libq2emu.so /etc/init.d/S11logo_display_shell start
+    /usr/bin/dbus-daemon --config-file=/etc/dbus-1/system.conf
+    sleep 1
+    (cd /tmp/q2emu/cores && LD_PRELOAD=/lib/libq2emu.so exec /release/bin/demo) &
+    demo=$! booted=$(date +%s)
+    while [ -z "$want" ]; do  # a trapped signal interrupts wait; demo ending returns from it
+        wait $demo; status=$?
+        kill -0 $demo 2>/dev/null || break
+    done
+    kill -9 -1 2>/dev/null  # from PID 1: every other process in the box
+    sleep 1
+    case $want in
+        reboot)
+            echo "== q2emu: the firmware rebooted"
+            if [ $(( $(date +%s) - booted )) -lt 20 ]; then fast=$((fast + 1)); else fast=0; fi
+            if [ $fast -ge 3 ]; then echo "== q2emu: reboot loop, stopping"; exit 97; fi
+            continue ;;
+        off) echo "== q2emu: the firmware powered off"; exit 0 ;;
+        *) echo "== q2emu: demo ended by itself, status $status"
+           [ "${status:-1}" = 0 ] && status=98  # 0 stays a power-off's
+           exit ${status:-1} ;;
+    esac
+done
+'''
+BATTERY = {  # sysfs files the firmware reads for the battery; fixed at 100%, full, 4.2 V
+    'sys/devices/i2c-0/0-0062/cw2015_capacity': '100',
+    'sys/devices/i2c-0/0-0062/cw2015_voltage': '4200',
+    'sys/class/power_supply/battery/status': 'Full',
+}
+STRACE = 'QEMU_STRACE=1 '  # before LD_PRELOAD with --strace: demo's system calls, in its log
+# The firmware's watchdog (started by demo) runs `pgrep /release/bin/demo` every few seconds and reboots
+# when it finds nothing. Under QEMU, demo's process is named after QEMU, so it never finds it and would
+# reboot the Q2 seconds after every boot. Its stand-in keeps the name (the firmware killalls it by name)
+# and only waits; the start script already notices a demo that has ended. The original is kept beside it.
+WATCHDOG = 'usr/bin/checkappprocess.sh'
+WATCHDOG_STANDIN = '''#!/bin/sh
+# q2emu stand-in (the original is checkappprocess.sh.q2emu-orig): see WATCHDOG in q2emu.py.
+while :; do sleep 3600; done
+'''
+SD_SLOT =['dev/mmcblk4'] + [f'dev/mmcblk4p{i}' for i in range(10)]  # the Q2's card slot, as the firmware looks for it
+BINFMT_RULE = pathlib.Path('/proc/sys/fs/binfmt_misc/q2mipsel')
+
+
+def run(*args, **kw):
+    return subprocess.run([str(a) for a in args], check=True, **kw)
+
+
+def lock(work):
+    """Hold work/lock for as long as the returned file stays open: one emulator a work folder, since a second
+    would share the framebuffer file and the input sockets, or delete the rootfs under the first."""
+    work.mkdir(parents=True, exist_ok=True)
+    f = open(work/'lock', 'w')
+    try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        raise RuntimeError(f'another q2emu is already running on {work}')
+    return f
+
+
+def remove_rootfs(root):
+    """Delete an unpacked rootfs, but never through a mount still inside it (mnt/mmc can be the user's own
+    music folder, bind-mounted as the SD card)."""
+    for m in 'proc', 'mnt/mmc':
+        if os.path.ismount(root/m): subprocess.run(['umount', str(root/m)], capture_output=True)
+        if os.path.ismount(root/m): raise RuntimeError(f'{root/m} is still mounted; unmount it and retry')
+    shutil.rmtree(root)
+
+
+def symbol(elf, name):
+    """The address of an exported symbol (.dynsym) in a 32-bit little-endian ELF, or None. The firmware's
+    globals are looked up by name rather than written in as numbers, so another firmware build still works."""
+    data = pathlib.Path(elf).read_bytes()
+    shoff, = struct.unpack_from('<I', data, 32)
+    shentsize, shnum = struct.unpack_from('<HH', data, 46)
+    sections = [struct.unpack_from('<IIIIIIIIII', data, shoff + i * shentsize) for i in range(shnum)]
+    for _, kind, _, _, off, size, link, _, _, entsize in sections:
+        if kind != 11 or not entsize: continue  # SHT_DYNSYM
+        strtab = sections[link][4]
+        for i in range(size // entsize):
+            st_name, st_value = struct.unpack_from('<II', data, off + i * entsize)
+            end = data.index(b'\0', strtab + st_name)
+            if data[strtab + st_name:end] == name.encode(): return st_value
+    return None
+
+
+def unpack(firmware, root):
+    """The rootfs of an update.tar, or of a stock ZIP holding one, into root."""
+    work = root.parent
+    tar = firmware
+    if zipfile.is_zipfile(firmware):
+        with zipfile.ZipFile(firmware) as z:
+            name = next(n for n in z.namelist() if n.endswith('update.tar'))
+            tar = work/'update.tar'
+            tar.write_bytes(z.read(name))
+    with tarfile.open(tar) as t:
+        (work/'rootfs.squashfs').write_bytes(t.extractfile('recovery-update/rootfs.squashfs').read())
+    run('unsquashfs', '-q', '-f', '-no-xattrs', '-d', root, work/'rootfs.squashfs', stdout=subprocess.DEVNULL)
+
+
+# Emulator-internal stub: the firmware's home_page_init registers ALL input handlers (keys, touch, wheel,
+# idle, timers) only when strlen(g_product_sncode) == 14 — a per-unit serial filled by reading /dev/mtd5,
+# hardware that doesn't exist in the emulator.  Without the handlers, nothing past the first screen responds.
+# This patch makes the branch unconditional so the handlers are always registered.  It is applied to the
+# emulator's own working copy of the binary, never to a file that ships to real hardware.
+# The branch is found inside home_page_init by its exact instruction (in V1.36 and the Pod builds on it,
+# home_page_init is at 0x534b6c and the branch at +0x40, 0x534bac).
+_SERIAL_BEQ   = 0x10430007                      # beq $v0, $v1, +7  (original)
+_SERIAL_ALWAYS = 0x10000007                     # beq $zero, $zero, +7  (patched: always taken)
+_SERIAL_SCAN = 0x80                             # how far into home_page_init the gate is looked for
+
+
+def _file_offset(data, vaddr):
+    """The file offset of a virtual address inside one of the ELF's loaded segments, or None."""
+    e_phoff, = struct.unpack_from('<I', data, 28)
+    e_phentsize, e_phnum = struct.unpack_from('<HH', data, 42)
+    for i in range(e_phnum):
+        p_type, p_offset, p_vaddr, _, p_filesz = struct.unpack_from('<IIIII', data, e_phoff + i * e_phentsize)
+        if p_type == 1 and p_vaddr <= vaddr < p_vaddr + p_filesz:
+            return vaddr - p_vaddr + p_offset
+    return None
+
+
+def _patch_serial_check(demo):
+    """Stub home_page_init's serial-length gate so input handlers are registered without /dev/mtd5."""
+    start = symbol(demo, 'home_page_init')
+    if start is None:
+        raise RuntimeError('this firmware has no home_page_init symbol: the input gate cannot be found')
+    data = bytearray(demo.read_bytes())
+    base = _file_offset(data, start)
+    if base is None:
+        raise RuntimeError(f'home_page_init (0x{start:08x}) is outside the loaded segments')
+    for off in range(base, base + _SERIAL_SCAN, 4):
+        insn, = struct.unpack_from('<I', data, off)
+        if insn == _SERIAL_ALWAYS: return  # already patched
+        if insn == _SERIAL_BEQ:
+            struct.pack_into('<I', data, off, _SERIAL_ALWAYS)
+            demo.write_bytes(bytes(data))
+            return
+    raise RuntimeError(f'the serial-length gate was not found in home_page_init (0x{start:08x}): '
+                       'this firmware build differs from the ones the emulator knows')
+
+
+PREBUILT = HERE/'libq2emu.so'  # shim.c compiled ahead (tools/build_shim.py), with the hash of the shim.c it came from
+
+
+def compile_shim(libc, target, out):
+    """shim.c as a MIPS shared library, linked against a firmware's libc.so.6. Needs clang and lld."""
+    obj = out/'shim.o'
+    run('clang', '--target=mipsel-linux-gnu', '-march=mips32r2', '-mabi=32', '-mfp64', '-mnan=2008', '-mabs=2008',
+        '-mabicalls', '-fPIC', '-Os', '-ffreestanding', '-fno-builtin', '-Wall', '-c', HERE/'shim.c', '-o', obj)
+    run('ld.lld', '-m', 'elf32ltsmip', '-shared', '-z', 'noexecstack', '--hash-style=sysv', obj, libc, '-o', target)
+
+
+def build_shim(root, out):
+    """libq2emu.so into the rootfs: compiled here where clang and lld are installed (a developer's machine),
+    else the copy compiled ahead, as long as it came from this very shim.c. The shim only asks libc for a
+    few functions by name, so the copy linked against V1.36's libc serves the builds based on it."""
+    target = root/'lib/libq2emu.so'
+    if shutil.which('clang') and shutil.which('ld.lld'):
+        return compile_shim(root/'lib/libc.so.6', target, out)
+    stamp = PREBUILT.with_name(PREBUILT.name + '.sha256')
+    digest = hashlib.sha256((HERE/'shim.c').read_bytes()).hexdigest()
+    if not PREBUILT.exists() or not stamp.exists() or stamp.read_text().strip() != digest:
+        raise RuntimeError('clang and lld are not installed, and there is no libq2emu.so compiled from this shim.c')
+    shutil.copy(PREBUILT, target)
+    target.chmod(0o755)
+
+
+def find_qemu():
+    """The qemu-mipsel-static to run the firmware with, or None.
+
+    Q2EMU_QEMU wins. Otherwise the known-good 11.1.3 builds (this project's bin/ first) are tried before PATH, because sudo resets
+    PATH and drops Q2EMU_QEMU unless it is passed on the sudo line, and a distro 8.2.2 found on PATH
+    deadlocks under demo."""
+    if os.environ.get('Q2EMU_QEMU'):
+        return os.environ['Q2EMU_QEMU']
+    homes = [pathlib.Path.home()]
+    if os.environ.get('SUDO_USER'):
+        import pwd
+        try: homes.insert(0, pathlib.Path(pwd.getpwnam(os.environ['SUDO_USER']).pw_dir))
+        except KeyError: pass
+    candidates = [HERE.parent/'bin/qemu-mipsel-static', pathlib.Path('/opt/q2-qemu/bin/qemu-mipsel-static')]
+    candidates += [h/'q2/archive/q2-qemu-bin/qemu-mipsel-static' for h in homes]
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return str(c)
+    return shutil.which('qemu-mipsel-static')
+
+
+def prepare(root, sd, strace=False, qemu_env=''):
+    """The device nodes' stand-ins, the mounts and the binfmt_misc rule the firmware's programs run through."""
+    # ponytail: Ubuntu 24.04's qemu-user-static 8.2.2 deadlocks under demo (every thread waits on one of
+    # QEMU's own locks soon after the first frames); 11.1.3 built from source runs it. Q2EMU_QEMU names one.
+    qemu = find_qemu()
+    if not qemu: sys.exit('qemu-mipsel-static is missing: set Q2EMU_QEMU, or put the 11.1.3 build at /opt/q2-qemu/bin')
+    misc = BINFMT_RULE.parent
+    if not (misc/'register').exists(): run('mount', '-t', 'binfmt_misc', 'binfmt_misc', misc)
+    if BINFMT_RULE.exists() and f'interpreter {qemu}\n' not in BINFMT_RULE.read_text():
+        BINFMT_RULE.write_text('-1')  # another QEMU's rule: drop it
+    if not BINFMT_RULE.exists(): (misc/'register').write_text(BINFMT.format(qemu=qemu))
+    dev = root/'dev'
+    (dev/'input').mkdir(parents=True, exist_ok=True)
+    for name, major, minor in ('null', 1, 3), ('zero', 1, 5), ('random', 1, 8), ('urandom', 1, 9), ('tty', 5, 0):
+        if not (dev/name).exists(): run('mknod', '-m', '666', dev/name, 'c', major, minor)
+    with open(dev/'fb0', 'wb') as f: f.truncate(XRES * YRES * 2 * 4)
+    for name in 'shanling_dac', 'mcu': (dev/name).write_bytes(b'')
+    for name in DEVICES.values():  # the shim opens these as connections to Q2's sockets; the node only has to exist
+        (dev/'input'/name).unlink(missing_ok=True)
+        (dev/'input'/name).write_bytes(b'')
+    for d in 'tmp/q2emu', 'var/run/dbus', 'mnt/data', 'mnt/mmc': (root/d).mkdir(parents=True, exist_ok=True)
+    for f in ('tmp/q2emu/ioctl.log', 'tmp/q2emu/fb.pan', 'tmp/q2emu/fb.blank', 'tmp/q2emu/fb.drawn',
+              'var/run/dbus/system_bus_socket'):
+        (root/f).unlink(missing_ok=True)
+    # The battery, always full: the firmware reads the CW2015 fuel gauge from sysfs and, finding nothing,
+    # takes the battery as empty and shows "Shutdown". Same values as the verified stub runs (stub-8..15).
+    for path, value in BATTERY.items():
+        (root/path).parent.mkdir(parents=True, exist_ok=True)
+        (root/path).write_text(value + '\n')
+    # The SD card. The firmware sees a card only with all three: the hotplug flag /tmp/mmc_add, the slot's
+    # block-device nodes, and /mnt/mmc being a mount point of its own (it compares st_dev with /mnt's).
+    for p in SD_SLOT + ['tmp/mmc_add']: (root/p).unlink(missing_ok=True)
+    if os.path.ismount(root/'mnt/mmc'):  # left by a run that was killed: it may be another folder's
+        subprocess.run(['umount', str(root/'mnt/mmc')], capture_output=True)
+    if sd:
+        if not os.path.ismount(root/'mnt/mmc'): run('mount', '--bind', sd, root/'mnt/mmc')
+        for p in SD_SLOT + ['tmp/mmc_add']: (root/p).write_bytes(b'')
+    watchdog = root/WATCHDOG
+    if watchdog.exists() and watchdog.read_text(errors='replace') != WATCHDOG_STANDIN:
+        shutil.copy2(watchdog, watchdog.with_name(watchdog.name + '.q2emu-orig'))
+        watchdog.write_text(WATCHDOG_STANDIN)
+        watchdog.chmod(0o755)
+    # g_backlight_status gates all input; the shim sets it on MCU ioctls, at the address found here.
+    backlight = symbol(root/'release/bin/demo', 'g_backlight_status')
+    env = (f'Q2EMU_BL_ADDR=0x{backlight:x} ' if backlight else '') + (STRACE if strace else '') + (qemu_env + ' ' if qemu_env else '')
+    (root/'q2emu-start.sh').write_text(START.replace('LD_PRELOAD=', env + 'LD_PRELOAD='))
+    (root/'usr/share/alsa/alsa.conf.d').mkdir(parents=True, exist_ok=True)
+    (root/'usr/share/alsa/alsa.conf.d/99-q2emu.conf').write_text(ASOUND)
+    (root/'q2emu-start.sh').chmod(0o755)
+
+
+# sh -c TETHER % 'unshare ...' <the box's command>, with a pipe as stdin: runs the box, and kills it when
+# the pipe closes ($$ is the shell that becomes unshare; unshare's --kill-child does the rest).
+TETHER = 'exec 3<&0; ( cat <&3 >/dev/null 2>&1; kill -KILL $$ ) & exec %s sh -c "$0" 3<&- </dev/null'
+
+
+class Q2:
+    """The running firmware: its screen and its input devices."""
+
+    def __init__(self, root, log):
+        self.root = root
+        # One listening socket a device: the shim connects each open of /dev/input/eventN to it, and an
+        # event goes to every connection, as evdev gives every opener the whole stream.
+        self.servers, self.readers = {}, {k: [] for k in DEVICES}
+        for k, n in DEVICES.items():
+            path = root/'tmp/q2emu'/f'{n}.sock'
+            path.unlink(missing_ok=True)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(path))
+            server.listen(16)
+            server.setblocking(False)
+            self.servers[k] = server
+        # A box of its own. The firmware runs as root and treats the machine as its Q2: its watchdog
+        # (checkappprocess.sh) and power-off run `reboot`, it sets the clock, loads modules and configures
+        # the network. So: its own PID, network, IPC and UTS namespaces (a reboot reaches only this script's
+        # child, and Wi-Fi finds no interface), /proc/sysrq-trigger and /proc/sys out of reach, and no
+        # capability to reboot, set the clock, load modules or touch raw I/O.
+        r = shlex.quote(str(root))
+        drop = '-sys_boot,-sys_time,-sys_module,-sys_rawio,-sys_admin,-net_admin,-mknod'
+        inside = (f'mount -t proc proc {r}/proc && {{ [ ! -e {r}/proc/sysrq-trigger ] || mount --bind /dev/null {r}/proc/sysrq-trigger; }} && '
+                  f'mount --bind {r}/proc/sys {r}/proc/sys && mount -o remount,ro,bind {r}/proc/sys && '
+                  f'exec setpriv --bounding-set {drop} --inh-caps {drop} chroot {r} /q2emu-start.sh')
+        # A tether: beside the box, `cat` reads a pipe whose only write end is this program's. However this
+        # program ends (closed, killed, its terminal gone), the pipe closes, cat returns and the box is
+        # killed. Without it a firmware outlives its window, its input threads spinning on closed sockets.
+        self.proc = subprocess.Popen(['sh', '-c', TETHER % 'unshare --pid --fork --mount --net --ipc --uts --kill-child',
+                                      inside], stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+        self.wheel_x = 100
+        self._emit_lock = threading.Lock()  # emit() may be called from more than one thread (the GUI's)
+
+    def stop(self):
+        """End the box (unshare's --kill-child takes the namespace's init with it, and so every process in
+        it), then undo what prepare() left on the host: the SD card's bind mount and the binfmt_misc rule.
+        SIGUSR2 first, not SIGTERM: the start script takes SIGTERM as the firmware's reboot, and unshare
+        --fork passes SIGTERM on rather than dying of it, but SIGUSR2 is a power-off to both."""
+        for sig in (signal.SIGUSR2, signal.SIGKILL):
+            try: os.killpg(self.proc.pid, sig)
+            except ProcessLookupError: break
+            try:
+                self.proc.wait(timeout=3)
+                break
+            except subprocess.TimeoutExpired: pass
+        try: self.proc.stdin.close()  # lets the tether go
+        except OSError: pass
+        for s in [*self.servers.values(), *(r for rs in self.readers.values() for r in rs)]:
+            s.close()
+        if os.path.ismount(self.root/'mnt/mmc'):
+            subprocess.run(['umount', str(self.root/'mnt/mmc')], capture_output=True)
+        try: BINFMT_RULE.write_text('-1')
+        except OSError: pass
+
+    def emit(self, device, *events):
+        with self._emit_lock:
+            t = time.time()
+            sec, usec = int(t), int(t % 1 * 1e6)
+            data = b''.join(EVENT.pack(sec, usec, *e) for e in (*events, (EV_SYN, 0, 0)))
+            while True:  # openers since the last event
+                try: reader = self.servers[device].accept()[0]
+                except BlockingIOError: break
+                reader.setblocking(False)
+                self.readers[device].append(reader)
+            for reader in self.readers[device][:]:
+                try: reader.send(data)
+                except BlockingIOError: pass  # an opener that never reads: its buffer is full, as evdev's would drop
+                except OSError: self.readers[device].remove(reader)  # closed its end
+
+    def key(self, name, ms=80):
+        self.emit('keys', (EV_KEY, KEYS[name], 1))
+        time.sleep(ms / 1000)
+        self.emit('keys', (EV_KEY, KEYS[name], 0))
+
+    def touch(self, x, y, down=True, first=False):
+        """Upright screen coordinates; the panel's ABS_X is 319 - y and its ABS_Y is x."""
+        if not down: return self.emit('touch', (EV_ABS, ABS_PRESSURE, 0), (EV_KEY, BTN_TOUCH, 0))
+        events = [(EV_ABS, ABS_X, XRES - 1 - y), (EV_ABS, ABS_Y, x)]
+        if first: events += [(EV_ABS, ABS_PRESSURE, 1), (EV_KEY, BTN_TOUCH, 1)]
+        self.emit('touch', *events)
+
+    def tap(self, x, y, ms=120):
+        self.touch(x, y, first=True)
+        time.sleep(ms / 1000)
+        self.touch(x, y, down=False)
+
+    def swipe(self, x1, y1, x2, y2, ms=300):
+        n = max(1, int(ms / 1000 / SAMPLE_S))
+        for i in range(n + 1):
+            self.touch(x1 + (x2 - x1) * i // n, y1 + (y2 - y1) * i // n, first=not i)
+            time.sleep(SAMPLE_S)
+        self.touch(x2, y2, down=False)
+
+    def wheel(self, ticks):
+        """Positive is down/next: x falls. A touch, the travel in samples, the last repeated, a lift."""
+        travel = round((abs(ticks) + .5) * WHEEL_TICK)
+        n = -(-travel // WHEEL_STEP)
+        sign = -1 if ticks > 0 else 1
+        x = self.wheel_x
+        self.emit('wheel', (EV_ABS, ABS_X, x), (EV_ABS, ABS_PRESSURE, 1))
+        points = [(x + sign * (travel * i // n) - 1) % 200 + 1 for i in range(1, n + 1)]
+        for p in points + points[-1:] * 4:
+            time.sleep(SAMPLE_S)
+            self.emit('wheel', (EV_ABS, ABS_X, p))
+        self.emit('wheel', (EV_ABS, ABS_PRESSURE, 0))
+        self.wheel_x = points[-1]
+
+    def _told(self, name):
+        """A number the shim wrote for us (shim.c tell()), or None."""
+        try: return int((self.root/'tmp/q2emu'/name).read_text(), 16)
+        except (OSError, ValueError): return None
+
+    def started(self):
+        """demo has shown a picture of its own: the boot's loading screen is over."""
+        return self._told('fb.drawn') is not None
+
+    def screen_off(self):
+        """The firmware has switched its panel off (its idle timer). The frame stays as it was; the wheel
+        then sets the volume and touches are ignored, until the centre button (the Q2's power key) wakes it."""
+        return bool(self._told('fb.blank'))
+
+    def frame(self):
+        """The page the panel shows, upright, as a PIL image."""
+        from PIL import Image
+        try: page = int((self.root/'tmp/q2emu/fb.pan').read_text(), 16) // YRES
+        except (OSError, ValueError): page = 0
+        with open(self.root/'dev/fb0', 'rb') as f:
+            f.seek(page * XRES * YRES * 4)
+            data = f.read(XRES * YRES * 4)
+        return Image.frombuffer('RGBA', (XRES, YRES), data, 'raw', 'BGRA', 0, 1).convert('RGB').rotate(90, expand=True)
+
+    def script(self, text):
+        for step in filter(None, (s.split() for s in text.split(';'))):
+            word, args = step[0], step[1:]
+            if word == 'wait': time.sleep(float(args[0]))
+            elif word == 'key': self.key(args[0], *map(int, args[1:]))
+            elif word == 'wheel': self.wheel(int(args[0]))
+            elif word == 'tap': self.tap(*map(int, args))
+            elif word == 'swipe': self.swipe(*map(int, args))
+            elif word == 'shot': self.frame().save(args[0])
+            else: sys.exit(f'unknown script word: {word}')
+
+
+def window(q2):
+    """The screen at twice its size, the mouse as a finger, and the keys below."""
+    import tkinter as tk
+    from PIL import ImageTk
+    scale = 2
+    top = tk.Tk()
+    top.title('Q2 firmware (qemu)')
+    canvas = tk.Canvas(top, width=YRES * scale, height=XRES * scale, highlightthickness=0)
+    canvas.pack()
+    image = canvas.create_image(0, 0, anchor='nw')
+    state = {'photo': None, 'down': False}
+
+    def point(e): return max(0, min(YRES - 1, e.x // scale)), max(0, min(XRES - 1, e.y // scale))
+    def press(e): state['down'] = True; q2.touch(*point(e), first=True)
+    def move(e):
+        if state['down']: q2.touch(*point(e))
+    def release(e): state['down'] = False; q2.touch(0, 0, down=False)
+    canvas.bind('<ButtonPress-1>', press)
+    canvas.bind('<B1-Motion>', move)
+    canvas.bind('<ButtonRelease-1>', release)
+    bar = tk.Frame(top)
+    bar.pack(fill='x')
+    for label, action in (('Wheel up', lambda: q2.wheel(-1)), ('Wheel down', lambda: q2.wheel(1)),
+                          ('Centre', lambda: q2.key('centre')), ('Return', lambda: q2.key('return')),
+                          ('Prev', lambda: q2.key('prev')), ('Play', lambda: q2.key('play')),
+                          ('Next', lambda: q2.key('next'))):
+        tk.Button(bar, text=label, command=action).pack(side='left', expand=True, fill='x')
+    for sym, action in (('<Up>', lambda e: q2.wheel(-1)), ('<Down>', lambda e: q2.wheel(1)),
+                        ('<Return>', lambda e: q2.key('centre')), ('<Escape>', lambda e: q2.key('return')),
+                        ('<BackSpace>', lambda e: q2.key('return')), ('<space>', lambda e: q2.key('play')),
+                        ('<Left>', lambda e: q2.key('prev')), ('<Right>', lambda e: q2.key('next'))):
+        top.bind(sym, action)
+    canvas.bind('<MouseWheel>', lambda e: q2.wheel(-1 if e.delta > 0 else 1))
+    canvas.bind('<Button-4>', lambda e: q2.wheel(-1))
+    canvas.bind('<Button-5>', lambda e: q2.wheel(1))
+
+    def refresh():
+        frame = q2.frame().resize((YRES * scale, XRES * scale))
+        state['photo'] = ImageTk.PhotoImage(frame)
+        canvas.itemconfigure(image, image=state['photo'])
+        if q2.proc.poll() is None: top.after(50, refresh)
+        else: top.title(f'Q2 firmware (qemu): demo ended, status {q2.proc.returncode}')
+    refresh()
+    top.mainloop()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--firmware', type=pathlib.Path, help='an update.tar, or a stock ZIP holding one')
+    ap.add_argument('--work', type=pathlib.Path, default=pathlib.Path.home()/'.cache/q2emu',
+                    help='where the rootfs is unpacked and kept (default: %(default)s)')
+    ap.add_argument('--sd-card', type=pathlib.Path, help='a folder to mount as the card (/mnt/mmc)')
+    ap.add_argument('--script', help='input and screenshots to run instead of opening a window')
+    ap.add_argument('--strace', action='store_true', help="log demo's system calls (QEMU_STRACE) to demo.log")
+    ap.add_argument('--qemu-env', default='', metavar='NAME=VALUE', help="QEMU settings for demo alone, such as QEMU_GDB=/tmp/q2emu/gdb.sock (demo then waits for gdb-multiarch's target remote on ROOTFS/tmp/q2emu/gdb.sock)")
+    ap.add_argument('--fresh', action='store_true', help='unpack the firmware again, dropping the saved settings')
+    a = ap.parse_args()
+    if os.geteuid(): sys.exit('q2emu needs root: chroot, mounts and binfmt_misc')
+    root = a.work/'rootfs'
+    try: held = lock(a.work)  # taken before the rootfs is touched, held until exit  # noqa: F841
+    except RuntimeError as e: sys.exit(str(e))
+    if a.fresh and root.exists(): remove_rootfs(root)
+    if not root.exists():
+        if not a.firmware: sys.exit('--firmware is needed the first time')
+        unpack(a.firmware, root)
+    _patch_serial_check(root/'release/bin/demo')
+    build_shim(root, a.work)
+    prepare(root, a.sd_card, a.strace, a.qemu_env)
+    log = open(a.work/'demo.log', 'wb')
+    q2 = Q2(root, log)
+    try:
+        if a.script: q2.script(a.script)
+        else: window(q2)
+    finally:
+        q2.stop()
+
+
+if __name__ == '__main__':
+    main()
