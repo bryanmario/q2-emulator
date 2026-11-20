@@ -11,7 +11,7 @@ events to. Needs root, Linux, qemu-mipsel-static 11.1.3, squashfs-tools, clang a
 
 Script words: wait S | key NAME [MS] | wheel N | tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot FILE
 (keys: centre return play next prev; coordinates are the upright screen's, 375x320)."""
-import argparse, fcntl, hashlib, os, pathlib, re, shlex, shutil, signal, socket, struct, subprocess, sys, tarfile, threading, time, zipfile
+import argparse, fcntl, hashlib, mmap, os, pathlib, re, shlex, shutil, signal, socket, struct, subprocess, sys, tarfile, threading, time, zipfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 XRES, YRES = 320, 375                      # the panel's own portrait frame; the screen is it turned upright
@@ -19,7 +19,11 @@ EVENT = struct.Struct('<iiHHi')            # struct input_event, MIPS32
 EV_SYN, EV_KEY, EV_ABS, ABS_X, ABS_Y, ABS_PRESSURE, BTN_TOUCH = 0, 1, 3, 0, 1, 0x18, 0x14a
 KEYS = {'centre': 116, 'return': 103, 'play': 108, 'next': 163, 'prev': 165}
 DEVICES = {'keys': 'event1', 'touch': 'event2', 'wheel': 'event3', 'bt': 'event4'}
-WHEEL_TICK, WHEEL_STEP, SAMPLE_S = 28, 11, 0.02  # units a tick at 50% sensitivity; a sample's travel and period
+# As a real Q2's panels report (read from one, 2026-11-20: docs/DEVELOPMENT.md): the wheel and a moving
+# finger every 12 ms; a spin of the wheel travels about 6 of its 200 units a report (500 a second); a tap
+# lasts about 60 ms and a press of a button about 125; the touch panel says a finger is down with its
+# pressure alone (no BTN_TOUCH).
+WHEEL_TICK, WHEEL_STEP, SAMPLE_S = 28, 6, 0.012  # units a tick at 50% sensitivity; a report's travel and period
 BINFMT = (r':q2mipsel:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x08\x00:'
           r'\xff\xff\xff\xff\xff\xff\xff\x00\x00\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:{qemu}:F')
 # The DAC's PCMs, silent: alsa.conf loads alsa.conf.d before the Q2's own /mnt/data/asound.conf.
@@ -92,6 +96,49 @@ WATCHDOG_STANDIN = '''#!/bin/sh
 # q2emu stand-in (the original is checkappprocess.sh.q2emu-orig): see WATCHDOG in q2emu.py.
 while :; do sleep 3600; done
 '''
+# Programs of the firmware that work hardware which is not here, each replaced in the emulator's own
+# unpacked copy (never in a file that goes to a player) by a script of the same name: the firmware starts
+# them and kills them by name. The original is kept beside each as NAME.q2emu-orig.
+# Bluetooth, always: the firmware waits for rtk_hciattach to bring the radio up and, when it never does,
+# shows "Bluetooth abnormal" and reboots, at every start once Bluetooth is switched on. The stand-in leaves
+# the mark the real one leaves when the radio answers. No radio follows: Bluetooth switches on and finds nothing.
+BT_STANDINS = {
+    'usr/bin/rtk_hciattach': 'touch /tmp/rtk_init_success\nwhile :; do sleep 3600; done\n',
+    'usr/bin/hciconfig': 'exit 0\n',
+}
+# Wi-Fi, while the emulator's internet is on (wifi.py answers as wpa_supplicant, on its socket; the box's
+# wlan0 already has its address, from slirp4netns): wpa_supplicant only has to go to the background, udhcpc
+# only to say where names are looked up.
+WIFI_STANDINS = {
+    'usr/sbin/wpa_supplicant': '( while :; do sleep 3600; done ) >/dev/null 2>&1 &\nexit 0\n',
+    'sbin/udhcpc': 'echo "nameserver 10.0.2.3 # wlan0" > /tmp/resolv.conf\nwhile :; do sleep 3600; done\n',
+}
+STANDIN_MARK = '# q2emu stand-in'
+
+
+def stand_in(root, name, body):
+    """Put a stand-in script in place of the firmware's program name, keeping the original beside it."""
+    path = root/name
+    text = f'#!/bin/sh\n{STANDIN_MARK} (the original is {path.name}.q2emu-orig): see q2emu.py\n{body}'
+    kept = path.with_name(path.name + '.q2emu-orig')
+    if path.is_symlink() or path.exists():
+        if not path.is_symlink() and path.read_bytes() == text.encode(): return
+        if not (kept.is_symlink() or kept.exists()): path.rename(kept)   # (a busybox link is kept as the link)
+        else: path.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+
+
+def original(root, name):
+    """Undo stand_in: the firmware's own program is back."""
+    path = root/name
+    kept = path.with_name(path.name + '.q2emu-orig')
+    if kept.is_symlink() or kept.exists():
+        if path.is_symlink() or path.exists(): path.unlink()
+        kept.rename(path)
+
+
 SD_SLOT =['dev/mmcblk4'] + [f'dev/mmcblk4p{i}' for i in range(10)]  # the Q2's card slot, as the firmware looks for it
 BINFMT_RULE = pathlib.Path('/proc/sys/fs/binfmt_misc/q2mipsel')
 
@@ -262,12 +309,33 @@ def find_qemu():
     return shutil.which('qemu-mipsel-static')
 
 
-def prepare(root, sd, strace=False, qemu_env=''):
+# The QEMU of the measuring mode, with its counter and the libraries it needs: tools/build_count.sh makes
+# the folder. The same QEMU as the usual one, built with plugins, so about a sixth slower; q2count.c counts
+# the instructions each of the firmware's programs executes.
+COUNT = HERE.parent/'bin/count'
+
+
+def can_count():
+    return (COUNT/'q2count-run').is_file() and (COUNT/'qemu-mipsel').is_file() and (COUNT/'libq2count.so').is_file()
+
+
+def prepare(root, sd, strace=False, qemu_env='', internet=False, count=False):
     """The device nodes' stand-ins, the mounts and the binfmt_misc rule the firmware's programs run through."""
     # ponytail: Ubuntu 24.04's qemu-user-static 8.2.2 deadlocks under demo (every thread waits on one of
     # QEMU's own locks soon after the first frames); 11.1.3 built from source runs it. Q2EMU_QEMU names one.
     qemu = find_qemu()
     if not qemu: sys.exit('qemu-mipsel-static is missing: set Q2EMU_QEMU, or put the 11.1.3 build at /opt/q2-qemu/bin')
+    # Measuring mode: the firmware's programs run under the counting QEMU (see COUNT), which lives in the
+    # box as /q2emu-host with its libraries; the kernel starts each through its small launcher.
+    host = root/'q2emu-host'
+    if host.exists(): shutil.rmtree(host)
+    if count:
+        shutil.copytree(COUNT, host)
+        for f in [*host.iterdir(), COUNT/'q2count-run']: f.chmod(0o755)
+        qemu = str(COUNT/'q2count-run')
+    work = root/'tmp/q2emu/work'
+    if work.exists(): shutil.rmtree(work)
+    work.mkdir(parents=True)
     misc = BINFMT_RULE.parent
     if not (misc/'register').exists(): run('mount', '-t', 'binfmt_misc', 'binfmt_misc', misc)
     if BINFMT_RULE.exists() and f'interpreter {qemu}\n' not in BINFMT_RULE.read_text():
@@ -304,6 +372,18 @@ def prepare(root, sd, strace=False, qemu_env=''):
         shutil.copy2(watchdog, watchdog.with_name(watchdog.name + '.q2emu-orig'))
         watchdog.write_text(WATCHDOG_STANDIN)
         watchdog.chmod(0o755)
+    for name, body in BT_STANDINS.items(): stand_in(root, name, body)
+    for f in 'tmp/rtk_init_success', 'tmp/resolv.conf': (root/f).unlink(missing_ok=True)
+    for name, body in WIFI_STANDINS.items():
+        if internet: stand_in(root, name, body)
+        else: original(root, name)
+    # Where names are looked up: the Q2's /etc/resolv.conf is a link to a file in /tmp that its DHCP client
+    # writes. With the emulator's internet it is a file of its own, naming slirp4netns's resolver.
+    resolv = root/'etc/resolv.conf'
+    resolv.parent.mkdir(parents=True, exist_ok=True)
+    if resolv.is_symlink() or resolv.exists(): resolv.unlink()
+    if internet: resolv.write_text('nameserver 10.0.2.3\n')
+    else: resolv.symlink_to('../tmp/resolv.conf')
     # g_backlight_status gates all input; the shim sets it on MCU ioctls, at the address found here.
     backlight = symbol(root/'release/bin/demo', 'g_backlight_status')
     env = (f'Q2EMU_BL_ADDR=0x{backlight:x} ' if backlight else '') + (STRACE if strace else '') + (qemu_env + ' ' if qemu_env else '')
@@ -311,6 +391,71 @@ def prepare(root, sd, strace=False, qemu_env=''):
     (root/'usr/share/alsa/alsa.conf.d').mkdir(parents=True, exist_ok=True)
     (root/'usr/share/alsa/alsa.conf.d/99-q2emu.conf').write_text(ASOUND)
     (root/'q2emu-start.sh').chmod(0o755)
+
+
+Q2_RAM_MB = 128  # the Q2's memory, all of it: its kernel and every program share it, and there is no swap
+Q2_CORES = 2     # the X2000 has two; the box is kept to two of the PC's (fbdev.py), so a program that starts a
+                 # thread a core (ffmpeg) starts as many as on a Q2, and takes the memory it would there
+# Read from a Q2 (Q2 Pod 1.8.8, idle in its Games list, 2026-11-20; docs/DEVELOPMENT.md has the reading):
+# its kernel leaves 117864 kB of the 128 MB (MemTotal), and with demo and hciplayer running 83028 kB
+# were available. Here the same two hold 28 MB by this file's count (on the Q2: 11 MB of their own pages
+# and 20 MB mapped from files), which puts what is unavailable besides the programs at 4 MB.
+# ponytail: one reading, one state: a Q2 with a large library or a card app running may differ.
+Q2_MEMTOTAL_KB, Q2_KERNEL_USE_MB = 117864, 4
+# What a Q2 does a second, timed on one (the same work counted here): 1.0 to 1.3 G instructions of
+# whole-number work (a shell loop, a tight loop), 0.31 G of decimal work, and far fewer when the work is
+# spread over more memory than its cache holds (6 million scattered reads took 1.4 s). So a time worked
+# out from this is the least it takes: work on decimals or on large data takes longer, and so does
+# anything that waits for the card (which read 21 MB a second).
+Q2_INSNS_PER_S = 1.08e9
+
+
+def meminfo(used_mb):
+    """/proc/meminfo as a Q2 whose programs hold used_mb would give it. The box's own would be the PC's:
+    gigabytes free, where Q2 Pod's video player and its chapter reader ask MemAvailable before they start."""
+    total = Q2_MEMTOTAL_KB
+    free = max(0, total - int((used_mb + Q2_KERNEL_USE_MB) * 1024))
+    rows = [('MemTotal', total), ('MemFree', free), ('MemAvailable', free), ('Buffers', 0), ('Cached', 0),
+            ('SwapCached', 0), ('SwapTotal', 0), ('SwapFree', 0)]
+    return ''.join(f'{name + ":":<16}{kb:>8} kB\n' for name, kb in rows)
+
+
+def box_programs(root):
+    """The firmware's programs running in the box of this rootfs: [(pid, name)], the name as the Q2's ps
+    would give it (each is a QEMU here, running the program its second argument names)."""
+    root, found = os.path.realpath(root), []
+    for d in os.listdir('/proc'):
+        if not d.isdigit(): continue
+        try:
+            if os.readlink(f'/proc/{d}/root') != root: continue
+            args = open(f'/proc/{d}/cmdline', 'rb').read().split(b'\0')
+        except OSError: continue
+        if len(args) < 2 or b'qemu-mipsel' not in args[0]: continue
+        words = [a.decode(errors='replace') for a in args[1:] if a]
+        while len(words) > 2 and words[0] in ('-plugin', '-E'): words = words[2:]  # the counting QEMU's own
+        if not words: continue
+        shell = os.path.basename(words[0]) in ('sh', 'busybox', 'ash') and len(words) > 1 and words[1].startswith('/')
+        found.append((int(d), os.path.basename(words[1] if shell else words[0])))
+    return found
+
+
+def guest_memory_kb(pid):
+    """How much memory the firmware's program in this QEMU holds, in kB: its share (Pss, so a library ten
+    programs share counts once) of the pages in the program's own address space. QEMU keeps a 32-bit
+    program's 2 GB at the bottom of its own, so those are the mappings below 0x80000000; QEMU's own
+    memory (its code, its heap, the translated code) lies far above and is not counted: a Q2 has none of it."""
+    total = 0
+    try:
+        with open(f'/proc/{pid}/smaps') as f:
+            ours = False
+            for line in f:
+                head = line.split(None, 2)
+                if len(head) >= 2 and '-' in head[0] and len(head[1]) == 4 and head[1][3] in 'ps':  # a mapping's first line
+                    ours = int(head[0].split('-')[0], 16) < 0x80000000
+                elif ours and line.startswith('Pss:'):
+                    total += int(line.split()[1])
+    except (OSError, ValueError): pass
+    return total
 
 
 # sh -c TETHER % 'unshare ...' <the box's command>, with a pipe as stdin: runs the box, and kills it when
@@ -321,8 +466,9 @@ TETHER = 'exec 3<&0; ( cat <&3 >/dev/null 2>&1; kill -KILL $$ ) & exec %s sh -c 
 class Q2:
     """The running firmware: its screen and its input devices."""
 
-    def __init__(self, root, log):
+    def __init__(self, root, log, internet=False):
         self.root = root
+        self.wifi = self._slirp = None
         # One listening socket a device: the shim connects each open of /dev/input/eventN to it, and an
         # event goes to every connection, as evdev gives every opener the whole stream.
         self.servers, self.readers = {}, {k: [] for k in DEVICES}
@@ -341,17 +487,116 @@ class Q2:
         # capability to reboot, set the clock, load modules or touch raw I/O.
         r = shlex.quote(str(root))
         drop = '-sys_boot,-sys_time,-sys_module,-sys_rawio,-sys_admin,-net_admin,-mknod'
+        self.used = (0, [])   # memory(), as last measured by _account
+        self.peak = (0, [])   # and the most it has been since the firmware started
+        self.work, self._seen_work, self._work_gone = None, {}, 0   # _count(), likewise
+        (root/'tmp/q2emu').mkdir(parents=True, exist_ok=True)
+        (root/'tmp/q2emu/meminfo').write_text(meminfo(30))
         inside = (f'mount -t proc proc {r}/proc && {{ [ ! -e {r}/proc/sysrq-trigger ] || mount --bind /dev/null {r}/proc/sysrq-trigger; }} && '
+                  f'mount --bind {r}/tmp/q2emu/meminfo {r}/proc/meminfo && '
                   f'mount --bind {r}/proc/sys {r}/proc/sys && mount -o remount,ro,bind {r}/proc/sys && '
                   f'exec setpriv --bounding-set {drop} --inh-caps {drop} chroot {r} /q2emu-start.sh')
         # A tether: beside the box, `cat` reads a pipe whose only write end is this program's. However this
         # program ends (closed, killed, its terminal gone), the pipe closes, cat returns and the box is
         # killed. Without it a firmware outlives its window, its input threads spinning on closed sockets.
-        self.proc = subprocess.Popen(['sh', '-c', TETHER % 'unshare --pid --fork --mount --net --ipc --uts --kill-child',
+        # The box's first step is fbdev.py: it puts the filter on the box that hands the screen's ioctls to
+        # this program (fbdev.Screen answers them, for the programs shim.c cannot be loaded into), and passes
+        # the filter's listening end back over a socket.
+        import fbdev
+        ours, theirs = socket.socketpair()
+        self.proc = subprocess.Popen([sys.executable, str(HERE/'fbdev.py'), str(theirs.fileno()),
+                                      'sh', '-c', TETHER % 'unshare --pid --fork --mount --net --ipc --uts --kill-child',
                                       inside], stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
-                                     start_new_session=True)
+                                     start_new_session=True, pass_fds=(theirs.fileno(),))
+        theirs.close()
+        self.screen = None
+        try:
+            ours.settimeout(15)
+            _, fds, _, _ = socket.recv_fds(ours, 1, 1)
+            if fds: self.screen = fbdev.Screen(fds[0], root/'dev/fb0', self._panned, self._blanked)
+        except OSError as e:
+            print('q2emu: the screen filter is not there:', e, file=sys.stderr, flush=True)
+        ours.close()
+        self._ended = threading.Event()
+        threading.Thread(target=self._account, daemon=True).start()
+        if internet:
+            import wifi
+            self.wifi = wifi.Wifi(root, open(root.parent/'wifi.log', 'w'))
+            self.wifi.start()
+            threading.Thread(target=self._connect, args=(log,), daemon=True).start()
         self.wheel_x = 100
+        self._fb, self._seen = None, None  # frame(): the mapped framebuffer, and (bytes, picture) last made
         self._emit_lock = threading.Lock()  # emit() may be called from more than one thread (the GUI's)
+
+    def memory(self):
+        """What the firmware's programs hold of the Q2's memory, about: (MB in all, [(name, MB), ...] the
+        largest first). Not the kernel's part, which a Q2 also takes from its 128 MB."""
+        by_name = {}
+        for pid, name in box_programs(self.root):
+            by_name[name] = by_name.get(name, 0) + guest_memory_kb(pid) / 1024
+        rows = sorted(by_name.items(), key=lambda r: -r[1])
+        return sum(mb for _, mb in rows), rows
+
+    def _count(self):
+        """The instructions the firmware's programs have executed since it was loaded, in measuring mode
+        (each keeps its count in a file, see q2count.c); None otherwise. Files are read again only when
+        they have changed, and one that is gone (the box's /tmp cleared) keeps what it last said."""
+        folder, seen, live = self.root/'tmp/q2emu/work', self._seen_work, set()
+        try: entries = list(os.scandir(folder))
+        except OSError: entries = []
+        for e in entries:
+            try: stamp = e.stat().st_mtime_ns
+            except OSError: continue
+            live.add(e.name)
+            if seen.get(e.name, (None, 0))[0] != stamp:
+                try:
+                    with open(e.path, 'rb') as f: data = f.read(8)
+                except OSError: continue
+                if len(data) == 8: seen[e.name] = (stamp, struct.unpack('<Q', data)[0])
+        for name in [n for n in seen if n not in live]: self._work_gone += seen.pop(name)[1]
+        return self._work_gone + sum(v for _, v in seen.values()) if (seen or self._work_gone) else None
+
+    def _account(self):
+        """Every second: measure what the firmware's programs hold, and let the box's /proc/meminfo say
+        what is left of a Q2's memory (written in place: the box has this very file mounted)."""
+        path = self.root/'tmp/q2emu/meminfo'
+        turn = 0
+        while not self._ended.wait(0.25) and self.proc.poll() is None:
+            turn += 1
+            try:
+                if turn % 4 == 0: self.work = self._count()
+                self.used = self.memory()
+                if self.used[0] > self.peak[0]: self.peak = self.used
+                with open(path, 'r+') as f:
+                    f.write(meminfo(self.used[0]))
+                    f.truncate()
+            except OSError: pass
+
+    def _tell(self, name, value):
+        """As shim.c's tell(): a number in a file of the box's /tmp/q2emu."""
+        try: (self.root/'tmp/q2emu'/name).write_text(f'{value & 0xffffffff:08x}\n')
+        except OSError: pass
+
+    def _panned(self, yoffset): self._tell('fb.pan', yoffset)   # (fbdev.Screen's thread)
+    def _blanked(self, how): self._tell('fb.blank', how)
+
+    def _connect(self, log):
+        """The emulator's internet: the box has a network of its own with nothing in it, and slirp4netns
+        puts one interface there, named wlan0 as the Q2's Wi-Fi is, that leads out through this PC as any
+        program's traffic does (no rights or settings of the PC are touched; the PC's own local services,
+        127.0.0.1, are out of the box's reach). It ends with the box."""
+        mine = os.readlink('/proc/self/ns/net')
+        for _ in range(100):  # until unshare has made the box's network
+            try:
+                if os.readlink(f'/proc/{self.proc.pid}/ns/net') != mine: break
+            except OSError: return
+            time.sleep(0.05)
+        else: return
+        try:
+            self._slirp = subprocess.Popen(['slirp4netns', '--configure', '--mtu=1500', '--disable-host-loopback',
+                                            str(self.proc.pid), 'wlan0'], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        except OSError as e:
+            print('q2emu: no internet for the player:', e, file=sys.stderr, flush=True)
 
     def stop(self):
         """End the box (unshare's --kill-child takes the namespace's init with it, and so every process in
@@ -369,6 +614,17 @@ class Q2:
         except OSError: pass
         for s in [*self.servers.values(), *(r for rs in self.readers.values() for r in rs)]:
             s.close()
+        self._ended.set()
+        if self.screen: self.screen.stop()
+        if self.wifi: self.wifi.stop()
+        if self._slirp and self._slirp.poll() is None:
+            self._slirp.terminate()
+            try: self._slirp.wait(timeout=3)
+            except subprocess.TimeoutExpired: self._slirp.kill()
+        fb, self._fb = self._fb, None
+        if fb is not None:
+            try: fb.close()
+            except (OSError, ValueError, BufferError): pass
         unmount(self.root/'mnt/mmc')
         try: BINFMT_RULE.write_text('-1')
         except OSError: pass
@@ -388,19 +644,24 @@ class Q2:
                 except BlockingIOError: pass  # an opener that never reads: its buffer is full, as evdev's would drop
                 except OSError: self.readers[device].remove(reader)  # closed its end
 
-    def key(self, name, ms=80):
-        self.emit('keys', (EV_KEY, KEYS[name], 1))
+    def press(self, name, down=True):
+        """A button going down, or coming up again. The firmware acts when it comes up (the centre button
+        about a quarter of a second after that), so how long it is held is how late the player answers."""
+        self.emit('keys', (EV_KEY, KEYS[name], 1 if down else 0))
+
+    def key(self, name, ms=125):
+        self.press(name)
         time.sleep(ms / 1000)
-        self.emit('keys', (EV_KEY, KEYS[name], 0))
+        self.press(name, False)
 
     def touch(self, x, y, down=True, first=False):
         """Upright screen coordinates; the panel's ABS_X is 319 - y and its ABS_Y is x."""
-        if not down: return self.emit('touch', (EV_ABS, ABS_PRESSURE, 0), (EV_KEY, BTN_TOUCH, 0))
+        if not down: return self.emit('touch', (EV_ABS, ABS_PRESSURE, 0))
         events = [(EV_ABS, ABS_X, XRES - 1 - y), (EV_ABS, ABS_Y, x)]
-        if first: events += [(EV_ABS, ABS_PRESSURE, 1), (EV_KEY, BTN_TOUCH, 1)]
+        if first: events += [(EV_ABS, ABS_PRESSURE, 1)]
         self.emit('touch', *events)
 
-    def tap(self, x, y, ms=120):
+    def tap(self, x, y, ms=60):
         self.touch(x, y, first=True)
         time.sleep(ms / 1000)
         self.touch(x, y, down=False)
@@ -420,7 +681,7 @@ class Q2:
         x = self.wheel_x
         self.emit('wheel', (EV_ABS, ABS_X, x), (EV_ABS, ABS_PRESSURE, 1))
         points = [(x + sign * (travel * i // n) - 1) % 200 + 1 for i in range(1, n + 1)]
-        for p in points + points[-1:] * 4:
+        for p in points + points[-1:] * 7:
             time.sleep(SAMPLE_S)
             self.emit('wheel', (EV_ABS, ABS_X, p))
         self.emit('wheel', (EV_ABS, ABS_PRESSURE, 0))
@@ -445,10 +706,15 @@ class Q2:
         from PIL import Image
         try: page = int((self.root/'tmp/q2emu/fb.pan').read_text(), 16) // YRES
         except (OSError, ValueError): page = 0
-        with open(self.root/'dev/fb0', 'rb') as f:
-            f.seek(page * XRES * YRES * 4)
-            data = f.read(XRES * YRES * 4)
-        return Image.frombuffer('RGBA', (XRES, YRES), data, 'raw', 'BGRA', 0, 1).convert('RGB').rotate(90, expand=True)
+        if self._fb is None:  # the framebuffer's file, mapped once: looking at it costs a copy, not a read
+            with open(self.root/'dev/fb0', 'rb') as f: self._fb = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        size = XRES * YRES * 4
+        data = self._fb[page * size:(page + 1) * size]
+        seen = self._seen
+        if seen and seen[0] == data: return seen[1]  # nothing new: the very same picture (callers only read it)
+        img = Image.frombuffer('RGBA', (XRES, YRES), data, 'raw', 'BGRA', 0, 1).convert('RGB').rotate(90, expand=True)
+        self._seen = (data, img)
+        return img
 
     def script(self, text):
         for step in filter(None, (s.split() for s in text.split(';'))):

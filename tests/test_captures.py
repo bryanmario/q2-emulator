@@ -40,7 +40,8 @@ class FakeQ2:
     def __init__(s, r, l): s.proc = FakeProc(); s.got = []; s.pic = HOME
     def stop(s): s.proc.returncode = -9
     def frame(s): return s.pic
-    def key(s, n): s.got.append(('key', n))
+    def key(s, n, ms=80): s.got.append(('key', n))
+    def press(s, n, down=True): s.got.append(('press', n, down))
     def wheel(s, t): s.got.append(('wheel', t))
     def touch(s, x, y, down=True, first=False):
         s.got.append(('touch', x, y, down, first))
@@ -152,6 +153,47 @@ for _ in range(30): gui._wheel(1)
 pump(0.1); gui._key('return'); pump(1.5); q2.wheel = quick
 turns = [t[1] for t in got if t[0] == 'wheel']
 ok(sum(turns) <= 12 and got[-1] == ('key', 'return'), f'a button pressed during a long spin cuts the rest of it off: {sum(turns)} of 30 turns made, then {got[-1]}')
+
+# a wheel button under the mouse goes down with it and comes up with it: no fixed hold added to every
+# click, and a long press is a long press
+got.clear(); bx, by = g.BUTTON_AT[g.KEY_BUTTONS['play']][:2]; s, (ox, oy) = gui.scale, gui.origin
+gui._on_press(E(ox + bx * s, oy + by * s)); pump(0.4)
+held, lit = list(got), gui._marks()
+gui._on_release(E(0, 0)); pump(0.2)
+ok(held == [('press', 'play', True)] and got == held + [('press', 'play', False)] and lit and lit[0][0] == 'button',
+   f'a wheel button is held for as long as the mouse holds it, and lit meanwhile: {got}')
+pump(0.3)
+
+# a swipe that starts on the frame above the screen and slides onto it begins at the screen's very edge:
+# the firmware opens its panel only for a swipe from the top edge, which a mouse cannot hit by itself
+got.clear(); s, (ox, oy) = gui.scale, gui.origin
+gui._on_press(E(ox + (30 + 187) * s, oy + (27 - 12) * s)); pump(0.05)
+none_yet = not got
+gui._on_drag(E(ox + (30 + 187) * s, oy + (27 + 9) * s)); pump(0.05); gui._on_drag(E(ox + (30 + 187) * s, oy + (27 + 150) * s)); pump(0.05)
+gui._on_release(E(0, 0)); pump(0.2)
+touches = [t for t in got if t[0] == 'touch']
+ok(none_yet and touches and touches[0][1:] == (187, 0, True, True) and touches[1][1:3] == (187, 9) and touches[-1][3] is False,
+   f'a drag from the frame onto the screen is a swipe from its edge: {touches[:3]}')
+pump(0.3)
+
+# the player's memory, shown when asked for: what its programs hold of a Q2's 128 MB, red when that is more than a Q2 has
+gui.runner.q2.used = (61.4, [('demo', 40.2), ('hciplayer', 3.1), ('sleep', 0.4)]); pump(0.2)
+hidden = not gui.meter.winfo_ismapped()
+gui._meter_var.set(True); pump(0.3)
+text = gui.meter.cget('text')
+gui.runner.q2.used = (169.0, [('ffmpeg', 142.0), ('demo', 21.0)]); pump(0.3)
+warned = gui.overlay.is_open and gui.overlay.kind == 'note' and 'More memory than a Q2 has: 169 MB' in gui.status.cget('text')
+ok(warned and gui.runner.state == 'running', 'going over a Q2\'s memory is said in the window, and nothing is stopped')
+gui.overlay.close(); gui._notice = None
+ok(hidden and gui.meter.winfo_ismapped() and "61 MB of the Q2's 128 MB" in text and 'demo 40' in text and 'sleep' not in text
+   and 'more than a real Q2' in gui.meter.cget('text') and gui.meter.cget('fg') == '#e0584e',
+   f'the memory line: {text!r}, then {gui.meter.cget("text")[:70]!r}')
+gui._meter_var.set(False); pump(0.3); ok(not gui.meter.winfo_ismapped(), 'and it goes away when switched off')
+
+# measuring mode: the work since the last input, under the status line
+gui.runner.q2.work = 5_000_000_000; pump(0.2); gui._key('return'); gui.runner.q2.work = 5_296_600_000; pump(0.3)
+ok("Work: 297 M instructions since your last input (at least 0.3 s of a Q2's processor), 5.3 G since it started" in gui.meter.cget('text'), f'the work line: {gui.meter.cget("text")!r}')
+gui.runner.q2.work = None; pump(0.3)
 
 # the firmware's screen-off timer: shown as off, not as a picture that looks frozen; any input only wakes it
 got.clear(); gui._notice = None; gui.runner.q2.off = True; pump(0.3)

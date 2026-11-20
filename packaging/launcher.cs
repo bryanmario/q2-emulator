@@ -17,6 +17,7 @@ using System.Drawing;
 using System.IO;
 using System.IO.Compression;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -130,7 +131,10 @@ static class Launcher
         Thread drain = new Thread(delegate() { errors.Append(Decode(ReadAll(emulator.StandardError.BaseStream))); });
         drain.Start();
 
-        if (!emulator.WaitForExit(3000)) CloseSplash();  // its window is up (or about to be)
+        // The starting window stays until the emulator's own is on screen (half a minute at most), so the
+        // one follows the other without a gap; it has no taskbar button, so the taskbar only ever shows one.
+        for (int i = 0; i < 200 && !emulator.WaitForExit(150) && !WindowUp(); i++) { }
+        CloseSplash();
         emulator.WaitForExit();
         drain.Join(2000);
         CloseSplash();
@@ -337,6 +341,33 @@ static class Launcher
         return string.Join("\n", lines, from, lines.Length - from).Trim();
     }
 
+    // -- The emulator's window, as Windows sees it --
+
+    delegate bool EachWindow(IntPtr window, IntPtr unused);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EachWindow each, IntPtr unused);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr window, StringBuilder text, int max);
+
+    // Is a window titled as the emulator's (emulator_gui.py: "Shanling Q2 Emulator...") on screen?
+    static bool WindowUp()
+    {
+        bool found = false;
+        try
+        {
+            EnumWindows(delegate(IntPtr window, IntPtr unused)
+            {
+                if (!IsWindowVisible(window)) return true;
+                StringBuilder text = new StringBuilder(64);
+                GetWindowText(window, text, 64);
+                if (!text.ToString().StartsWith("Shanling Q2 Emulator")) return true;
+                found = true;
+                return false;
+            }, IntPtr.Zero);
+        }
+        catch (Exception) { }
+        return found;
+    }
+
     // -- The small "starting" window --
 
     static void MakeSplash()
@@ -347,7 +378,8 @@ static class Launcher
         splash.StartPosition = FormStartPosition.CenterScreen;
         splash.ClientSize = new Size(380, 110);
         splash.BackColor = Color.FromArgb(0x16, 0x1d, 0x2b);
-        splash.ShowInTaskbar = true;
+        splash.ShowInTaskbar = false;  // the emulator's own window brings the taskbar's one button
+        splash.TopMost = true;         // and without a button, it must not get lost behind other windows
         try { splash.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch (Exception) { }
         Label name = new Label();
         name.Text = Title;

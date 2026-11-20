@@ -4,8 +4,8 @@
 set -e
 apk update -q
 # python + Tk + Pillow: the window.  squashfs-tools: unpacking firmware.  util-linux: unshare, setpriv, mount.
-# ffmpeg: recording.  font-dejavu + fontconfig: the window's text.
-apk add -q python3 py3-pillow python3-tkinter tk squashfs-tools util-linux ffmpeg font-dejavu fontconfig
+# ffmpeg: recording.  font-dejavu + fontconfig: the window's text.  slirp4netns: the player's internet.
+apk add -q python3 py3-pillow python3-tkinter tk squashfs-tools util-linux ffmpeg font-dejavu fontconfig slirp4netns
 fc-cache -f >/dev/null
 cat > /etc/wsl.conf <<'EOF'
 [user]

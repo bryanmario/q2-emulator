@@ -130,7 +130,15 @@ class Door:
         if r.state == 'running':
             frame = r.frame()
             up = frame is not None and frame.getbbox() is not None and r.started()
+        used, work, peak = r.memory(), r.instructions(), r.memory_peak()
         return {'state': r.state, 'message': r.message, 'hint': r.hint, 'screen_up': up, 'screen_off': r.screen_off(),
+                # what the firmware's programs hold of the Q2's 128 MB, about (its kernel takes some too)
+                'memory': None if used is None else {'used_mb': round(used[0], 1), 'q2_mb': 128, 'q2_programs_mb': 111,
+                                                     'over': used[0] > 111, 'peak_mb': round(peak[0], 1) if peak else None,
+                                                     'programs': {name: round(mb, 1) for name, mb in used[1][:8]}},
+                # in measuring mode: the instructions the firmware has executed since it was loaded (the same
+                # on any PC and on a Q2); the difference between two readings is what the inputs between cost
+                'work_instructions': work,
                 'firmware': str(r.firmware) if r.firmware else None, 'loading': r.loading,
                 'screen_size': list(SCREEN), 'keys': list(KEYS)}
 

@@ -1,6 +1,6 @@
 /* libq2emu.so: preloaded into the Q2's own programs under qemu-mipsel, it answers the ioctls the Q2's
  * hardware would, for the plain files and sockets that stand in for the device nodes (q2emu.py makes them),
- * and logs every ioctl it sees to $Q2EMU_DIR/ioctl.log, so a new hardware request is found, not guessed.
+ * and logs each kind of ioctl it sees to $Q2EMU_DIR/ioctl.log, so a new hardware request is found, not guessed.
  * No libc headers: the build has only the firmware's own libraries to link against. */
 typedef unsigned int u32;
 typedef unsigned short u16;
@@ -63,7 +63,17 @@ static char *dir_path(char *o, const char *name) {
     *o = 0;
     return o;
 }
+/* Each kind of request is logged once a process (by its number, how it was answered and the node's last
+ * letter): the log is there to show what the firmware asks for, and demo asks the framebuffer twice for
+ * every picture it draws, 120 times a second. */
 static void note(const char *path, unsigned long req, long ret, const char *how) {
+    static unsigned long seen[96];
+    static unsigned count;
+    unsigned n = len(path);
+    unsigned long key = req ^ ((unsigned long)(unsigned char)how[0] << 20) ^ ((unsigned long)(n ? (unsigned char)path[n - 1] : 0) << 12) ^ (ret < 0 ? 1ul << 31 : 0);
+    for (unsigned i = 0; i < count; i++) if (seen[i] == key) return;
+    if (count == sizeof seen / sizeof *seen) return;
+    seen[count++] = key;
     char file[256], line[512], *o = line;
     dir_path(file, "/ioctl.log");
     int fd = sc(SYS_open, (long)file, 0x109 /* O_WRONLY | O_APPEND | O_CREAT, MIPS */, 0644);
@@ -157,7 +167,7 @@ static long evdev(const char *path, unsigned n, unsigned long req, unsigned char
         for (unsigned i = 0; i < 4; i++) b[8 + i] = max >> (8 * i);
         have = 24;
     } else if (nr == 0x02) have = 8;                               /* EVIOCGID */
-    else if (nr == 0x09) have = 4;                                 /* EVIOCGPROP */
+    else if (nr == 0x09) b[0] = wheel || touch ? 2 : 0, have = 4;  /* EVIOCGPROP: a Q2's panels are "direct" */
     else if (nr == 0x18) have = 96;                                /* EVIOCGKEY: nothing held */
     else if (nr > 0x20 && nr < 0x40) have = 2;                     /* the other event types' bits: none */
     else have = size < 8 ? size : 8;

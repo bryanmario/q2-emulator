@@ -63,7 +63,9 @@ Remove-Item -Recurse -Force $app -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force "$app\emulator", "$app\bin" | Out-Null
 Copy-Item "$Project\emulator\*.py", "$Project\emulator\shim.c", "$Project\emulator\libq2emu.so", "$Project\emulator\libq2emu.so.sha256", "$Project\emulator\icon.png", "$Project\emulator\q2emulator.desktop" "$app\emulator"
 Copy-Item "$Project\bin\qemu-mipsel-static" "$app\bin"
+if (Test-Path "$Project\bin\count\q2count-run") { Copy-Item -Recurse "$Project\bin\count" "$app\bin\count" }  # the measuring mode (tools/build_count.sh)
 Copy-Item "$Project\LICENSE" $app
+Copy-Item "$Project\docs\THIRD-PARTY.md" $app   # what the download bundles, and under which licenses
 $hashes = Get-ChildItem $app -Recurse -File | Sort-Object FullName | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash }
 $sha = [Security.Cryptography.SHA256]::Create()
 $version = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($hashes -join ''))) -replace '-', '').Substring(0, 16).ToLower()

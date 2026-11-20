@@ -30,7 +30,8 @@ class FakeQ2:
     def stop(s): s.proc.returncode = s.proc.returncode if s.proc.returncode is not None else -9
     def frame(s):  # black for 0.6 s, as the real one is while booting
         return Image.new('RGB', g.SCREEN_SIZE) if time.time() - s.t0 < 0.6 else HOME_FRAME
-    def key(s, n): pass
+    def key(s, n, ms=80): pass
+    def press(s, n, down=True): pass
     def touch(s, *a, **k): pass
     def wheel(s, t): pass
 unpacks = []
