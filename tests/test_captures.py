@@ -181,23 +181,23 @@ gui.runner.q2.used = (61.4, [('demo', 40.2), ('hciplayer', 3.1), ('sleep', 0.4)]
 hidden = not gui.meter.winfo_ismapped()
 gui._meter_var.set(True); pump(0.3)
 text = gui.meter.cget('text')
-gui.runner.q2.used = (169.0, [('ffmpeg', 142.0), ('demo', 21.0)]); pump(0.3)
-warned = gui.overlay.is_open and gui.overlay.kind == 'note' and 'More memory than a Q2 has: 169 MB' in gui.status.cget('text')
-ok(warned and gui.runner.state == 'running', 'going over a Q2\'s memory is said in the window, and nothing is stopped')
+gui.runner.q2.used = (169.0, [('ffmpeg', 142.0), ('demo', 21.0)]); pump(0.9)
+warned = gui.overlay.is_open and gui.overlay.kind == 'note' and "Over a real Q2's memory: 169 MB" in gui.status.cget('text')
+ok(warned and gui.runner.state == 'running', f'going over a Q2\'s memory is said in the window, and nothing is stopped: note {gui.overlay.kind}, status {gui.status.cget("text")[:70]!r}')
 gui.overlay.close(); gui._notice = None
-ok(hidden and gui.meter.winfo_ismapped() and "61 MB of the Q2's 128 MB" in text and 'demo 40' in text and 'sleep' not in text
-   and 'more than a real Q2' in gui.meter.cget('text') and gui.meter.cget('fg') == '#e0584e',
+ok(hidden and gui.meter.winfo_ismapped() and '61 MB of 128 MB' in text and 'demo 40 MB' in text and 'sleep' not in text
+   and "over a real Q2's limit" in gui.meter.cget('text') and gui.meter.cget('image'),
    f'the memory line: {text!r}, then {gui.meter.cget("text")[:70]!r}')
 gui._meter_var.set(False); pump(0.3); ok(not gui.meter.winfo_ismapped(), 'and it goes away when switched off')
 
 # measuring mode: the work since the last input, under the status line
 gui.runner.q2.work = 5_000_000_000; pump(0.2); gui._key('return'); gui.runner.q2.work = 5_296_600_000; pump(0.3)
-ok("Work: 297 M instructions since your last input (at least 0.3 s of a Q2's processor), 5.3 G since it started" in gui.meter.cget('text'), f'the work line: {gui.meter.cget("text")!r}')
+ok('Last action: 297 M instructions (0.3 s or more on a real Q2) Total 5.3 G' in gui.meter.cget('text'), f'the work line: {gui.meter.cget("text")!r}')
 gui.runner.q2.work = None; pump(0.3)
 
 # the firmware's screen-off timer: shown as off, not as a picture that looks frozen; any input only wakes it
 got.clear(); gui._notice = None; gui.runner.q2.off = True; pump(0.3)
-ok(gui._asleep and 'screen off' in gui.status.cget('text') and not ImageChops.difference(gui._clean, g.SLEEP_SCREEN).getbbox(),
+ok(gui._asleep and 'Screen off' in gui.status.cget('text') and not ImageChops.difference(gui._clean, g.SLEEP_SCREEN).getbbox(),
    f'the player switching its screen off shows as off: {gui.status.cget("text")[:60]}')
 gui._wheel(1); gui._on_press(E(130, 177)); gui._on_release(E(0, 0)); gui._key('play'); pump(0.3)
 ok(got == [('key', 'centre')], f'while it is off, a wheel turn, a click and a key only press its power key, once: {got}')
@@ -223,9 +223,9 @@ gui._power_btn._enter(None); gui._power_btn._tip_show(); pump(0.1)
 ok(gui._power_btn._tipwin is not None and not extra_windows(), 'a tip is a label inside the window')
 gui._power_btn._leave(None)
 gui._agent_var.set(True); gui._toggle_agent(); pump(0.2)
-ok('AI agent control enabled' in gui.status.cget('text') and gui.door is not None, f'agent control says so plainly: {gui.status.cget("text")}')
+ok('AI Agent Control: On' in gui.status.cget('text') and gui.door is not None, f'agent control says so plainly: {gui.status.cget("text")}')
 gui._agent_var.set(False); gui._toggle_agent(); pump(0.2)
-ok('AI agent control disabled' in gui.status.cget('text') and gui.door is None, 'and can be turned off')
+ok('AI Agent Control: Off' in gui.status.cget('text') and gui.door is None, 'and can be turned off')
 
 win.geometry(f'{w0 + 60}x{h0 + 40}'); gui._pick_shell('Silver'); pump(1.3); shot('b2_6_silver')
 gui.runner.close(); win.destroy()

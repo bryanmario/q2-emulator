@@ -56,23 +56,23 @@ POWERSHELL = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
 EXPLORER = '/mnt/c/Windows/explorer.exe'
 HELP = (  # More > Help: (heading, ((name, what it does), ...))
     ('Buttons', (
-        ('Power', 'Switches the player on or off. Its settings are kept.'),
-        ('Restart', 'Off and on again.'),
-        ('Screenshot', 'Saves a picture (F12).'),
-        ('Record', 'Records a video until you press it again (F9).'),
-        ('Firmware', 'Opens an update.tar or a firmware ZIP.'),
-        ('SD card', 'A music folder that the player sees as its card.'),
+        ('Power', 'Turns the player on or off (settings are kept).'),
+        ('Restart', 'Turns the player off and back on.'),
+        ('Screenshot', 'Saves a screenshot (F12).'),
+        ('Record', 'Starts or stops a video recording (F9).'),
+        ('Firmware', 'Loads an update.tar or a firmware ZIP.'),
+        ('SD Card', 'A music folder the player uses as its SD card.'),
     )),
     ('The player', (
-        ('Screen', 'Click to touch it, drag to swipe.'),
-        ('Wheel', 'Click its center or its four marks. Drag around it, or roll the mouse wheel, to scroll.'),
+        ('Screen', 'Click to tap, drag to swipe. For the top panel, drag down from the frame above the screen.'),
+        ('Wheel', 'Click the center or one of the four marks. Scroll with the mouse wheel, or drag around the wheel.'),
     )),
     ('Keyboard', (
         ('Enter', 'Center button'),
         ('Esc, Backspace', 'Back'),
         ('Space', 'Play / Pause'),
         ('Left, Right', 'Previous / Next'),
-        ('Up, Down', 'Turn the wheel'),
+        ('Up, Down', 'Scroll'),
     )),
 )
 SD_HELP = ('Choose any folder with music in it (MP3, FLAC and the like; folders inside it are fine). The player '
@@ -105,7 +105,7 @@ def friendly(error):
                 'The emulator knows Shanling V1.36 and the Q2 Pod builds based on it.')
     if 'still mounted' in e:
         return ("The SD card folder couldn't be released.",
-                'Use More > Eject SD card, then try again. If that fails, close the emulator and open it again.')
+                'Use More > Eject SD Card, then try again. If that fails, close the emulator and open it again.')
     if 'No such file or directory' in e and ('.tar' in e or '.zip' in e):
         return ("The firmware file wasn't found.", 'It may have been moved or renamed. Open it again.')
     if ('rootfs.squashfs' in e or 'StopIteration' in e or 'could not be opened' in e
@@ -167,14 +167,14 @@ def _message_screen(lines, bg='#0a090b'):
 
 IDLE_SCREEN = _message_screen([
     ('Q2 Emulator', '#c0c0c0', 20),
-    ('Click "Open firmware" to load', '#666666', 13),
-    ('an update.tar or firmware ZIP', '#666666', 13),
+    ('Click Firmware to load', '#666666', 13),
+    ('an update.tar or a firmware ZIP', '#666666', 13),
 ])
 SLEEP_SCREEN = _message_screen([('Screen off', '#9a9a9a', 16),
-                                ('The player switched its screen off.', '#666666', 12),
-                                ('Click it or press a key to wake it.', '#666666', 12)], bg='#000000')
+                                ('Idle timeout, same as a real Q2.', '#666666', 12),
+                                ('Click the player or press any key.', '#666666', 12)], bg='#000000')
 OFF_SCREEN = _message_screen([('Powered off', '#c0c0c0', 16),
-                              ('Press Power on to start again', '#666666', 13)])
+                              ('Press Power On to start', '#666666', 13)])
 
 
 _OUTLINE = Image.new('L', DEVICE_SIZE)  # white where the player is, black around it
@@ -700,6 +700,7 @@ class EmulatorGUI:
         self._woke_at = 0
         self._settle_at = 0        # the window's size is still changing until then: quick drawing
         self._layout_width = None  # the width the buttons were last laid out for
+        self._side = None          # the room left of the buttons, which the status line and the meter keep too
         self._save_size_at = None
 
         # -- Window --
@@ -728,7 +729,7 @@ class EmulatorGUI:
         self.view_size, self.scale, self.origin = DEVICE_SIZE, 1.0, (0, 0)
 
         # -- Status: a dot for the player's state, and a line of plain words --
-        line = tk.Frame(self.window, bg=self.BG)
+        self._line = line = tk.Frame(self.window, bg=self.BG)
         line.grid(row=1, column=0, sticky='ew', padx=12, pady=(2, 6))
         self._dot = tk.Canvas(line, width=10, height=10, highlightthickness=0, bg=self.BG)
         self._dot.pack(side='left', anchor='n', pady=4, padx=(2, 7))
@@ -742,7 +743,7 @@ class EmulatorGUI:
         def button(parent, *args, **kw):
             return controls.Button(tk, ImageTk, parent, *args, **kw)
         # -- The player's memory, for those who ask for it (More): what its programs hold of a Q2's 128 MB --
-        self.meter = tk.Label(self.window, bg=self.BG, fg=self.DIM, font=('DejaVu Sans', 8), justify='left', anchor='w')
+        self.meter = tk.Label(self.window, bg=self.BG, bd=0)   # a picture: controls.monitor
         self._meter_shown = None
         self._work_mark = None     # the instructions counted at the last input
         self._over = False         # the firmware holds more memory than a Q2 has (said once each time)
@@ -750,20 +751,20 @@ class EmulatorGUI:
         self.controls.grid(row=3, column=0, pady=(0, 12))
         row1 = tk.Frame(self.controls, bg=self.BG)
         row1.pack()
-        self._power_btn = button(row1, 'tile', 'power', 'Power on', self._power)
+        self._power_btn = button(row1, 'tile', 'power', 'Power On', self._power)
         self._restart_btn = button(row1, 'tile', 'restart', 'Restart', self._restart,
-                                   tip='Switch the player off and on again. Its settings are kept.')
-        self._shot_btn = button(row1, 'tile', 'camera', 'Screenshot', self._screenshot, tip='Save a picture (F12)')
+                                   tip='Turns the player off and back on (settings are kept).')
+        self._shot_btn = button(row1, 'tile', 'camera', 'Screenshot', self._screenshot, tip='Save a screenshot (F12)')
         self._rec_btn = button(row1, 'tile', 'record', 'Record', self._record, tip='Record a video (F9)')
         self._more_btn = button(row1, 'tile', 'more', 'More', self._more_popup,
-                                tip='Shell color, start fresh, captures, AI agent control, help')
+                                tip='Shell color, captures, internet, monitor, AI agent control, help')
         self._tiles = (self._power_btn, self._restart_btn, self._shot_btn, self._rec_btn, self._more_btn)
         row2 = tk.Frame(self.controls, bg=self.BG)
         row2.pack(pady=(6, 0))
-        self._fw_btn = button(row2, 'pill', 'folder', 'Open a firmware file', self._open_firmware,
-                              heading='Firmware', tip='Open an update.tar or a firmware ZIP')
+        self._fw_btn = button(row2, 'pill', 'folder', 'Open Firmware', self._open_firmware,
+                              heading='Firmware', tip='Load an update.tar or a firmware ZIP')
         self._sd_btn = button(row2, 'pill', 'card', 'None', self._mount_sd,
-                              heading='SD card', tip='Choose a music folder to use as the SD card')
+                              heading='SD Card', tip='Choose a music folder to use as the SD card')
         self._pills = (self._fw_btn, self._sd_btn)
         for group in (self._tiles, self._pills):
             for i, b in enumerate(group):
@@ -823,8 +824,8 @@ class EmulatorGUI:
         elif self.last_firmware:  # as it was left: the last firmware starts by itself
             self._load_firmware(self.last_firmware)
         elif remembered_fw:
-            self._say(f"The firmware used last time isn't where it was ({firmware_name(remembered_fw)}). "
-                      'Click Firmware to open it again.', 30)
+            self._say(f"Last firmware not found ({firmware_name(remembered_fw)}). "
+                      'Click Firmware to load it again.', 30)
         self._refresh()
 
     # -- Worker threads --
@@ -855,10 +856,16 @@ class EmulatorGUI:
     def _layout(self, width):
         """The buttons and the status line for a window this wide."""
         w = max(300, min(width - 20, self.CONTROLS_MAX))
+        side = max(10, (width - w) // 2)   # the buttons are centred: the lines above them start where they do
+        if side != self._side:
+            self._side = side
+            self._line.grid_configure(padx=(side, side))
+            if self.meter.winfo_manager():
+                self.meter.grid_configure(padx=(side, side))
         if w == self._layout_width:
             return
         self._layout_width = w
-        self.status.config(wraplength=max(200, width - 60))
+        self.status.config(wraplength=max(200, w - 30))
         tile = (w - self.GAP * (len(self._tiles) - 1)) // len(self._tiles)
         for b in self._tiles:
             b.set(size=(tile, 60))
@@ -900,10 +907,10 @@ class EmulatorGUI:
         if not again and o.closed_kind == 'menu' and time.time() - o.closed_at < 0.3:
             return  # this click on More is the one that just closed the menu
         o.open('menu', 'bottom')
-        o.row('Start this firmware fresh...', self._start_fresh, enabled=bool(self._firmware_to_start()))
-        o.row('Eject SD card', self._eject_sd, enabled=bool(self.runner.sd_card))
+        o.row('Reset Firmware Settings...', self._start_fresh, enabled=bool(self._firmware_to_start()))
+        o.row('Eject SD Card', self._eject_sd, enabled=bool(self.runner.sd_card))
         o.line()
-        o.choices('Shell color', list(SHELL_FINISHES), self.shell,
+        o.choices('Shell Color', list(SHELL_FINISHES), self.shell,
                   {name: finish.top for name, finish in SHELL_FINISHES.items()}, self._pick_shell)
         o.line()
 
@@ -911,28 +918,28 @@ class EmulatorGUI:
             var.set(not var.get())
             self.settings.set(key, var.get())
             self._more_popup(again=True)
-        o.row('Show the player in screenshots and videos', lambda: flip(self._device_var, 'include_device'),
+        o.row('Player Body in Captures', lambda: flip(self._device_var, 'include_device'),
               checked=self._device_var.get(), keep_open=True)
-        o.row('Show touches and button presses', lambda: flip(self._touches_var, 'show_touches'),
+        o.row('Touch and Button Marks', lambda: flip(self._touches_var, 'show_touches'),
               checked=self._touches_var.get(), keep_open=True)
-        o.row('Save my clicks with a video, to replay it', lambda: flip(self._steps_var, 'save_steps'),
+        o.row('Input Script with Videos', lambda: flip(self._steps_var, 'save_steps'),
               checked=self._steps_var.get(), keep_open=True)
-        o.row("Show the player's memory use", lambda: flip(self._meter_var, 'show_memory'),
+        o.row('Memory Meter', lambda: flip(self._meter_var, 'show_memory'),
               checked=self._meter_var.get(), keep_open=True)
-        o.row('Open the captures folder', self._open_captures)
-        o.row('Change the captures folder...', self._choose_captures)
+        o.row('Open Captures Folder', self._open_captures)
+        o.row('Change Captures Folder...', self._choose_captures)
         o.line()
 
         def agent():
             self._agent_var.set(not self._agent_var.get())
             self._toggle_agent()
-        o.row('AI agent control', agent, checked=self._agent_var.get())
-        o.row('Internet for the player (pretend Wi-Fi)', self._toggle_internet, checked=self.runner.internet)
+        o.row('AI Agent Control', agent, checked=self._agent_var.get())
+        o.row('Internet (Emulator Wi-Fi)', self._toggle_internet, checked=self.runner.internet)
         if can_count():
-            o.row("Measure the player's work (a little slower)", self._toggle_measure, checked=self.runner.measure)
-        o.row('Help and keyboard shortcuts', self._help)
+            o.row('Measuring Mode', self._toggle_measure, checked=self.runner.measure)
+        o.row('Help and Shortcuts', self._help)
         if os.environ.get('Q2EXE'):  # started by the Windows launcher, which is also what removes it
-            o.row('Remove Q2 Emulator from this PC...', self._uninstall)
+            o.row('Uninstall Q2 Emulator...', self._uninstall, danger=True)
 
     def _ask(self, title, text, yes, on_yes, no='Cancel'):
         """A question, over the player. yes calls on_yes(); no, or a click anywhere else, just closes it."""
@@ -967,7 +974,7 @@ class EmulatorGUI:
         for heading, rows in HELP:
             o.heading(heading)
             o.pairs(rows)
-        o.heading('SD card')
+        o.heading('SD Card')
         o.text(SD_HELP, dim=True, small=True)
         o.buttons(('Close', None, True))
 
@@ -1090,17 +1097,16 @@ class EmulatorGUI:
             text = self._notice[0]
         elif r.state == 'idle':
             text = (f'Last firmware: {firmware_name(self.last_firmware)}. Press Power on to start it, '
-                    'or Open firmware to pick another.' if self.last_firmware
-                    else 'Click Open firmware to load an update.tar or a firmware ZIP.')
+                    'or click Firmware to load another.' if self.last_firmware
+                    else 'Click Firmware to load an update.tar or a firmware ZIP.')
         elif r.state == 'loading':
             text = r.message
         elif r.state == 'running':
-            text = ('The player switched its screen off after a while without input, as a real one does. '
-                    'Click it or press any key to wake it.' if self._asleep
-                    else f'Running {name}. Touch the screen, use the wheel or the keyboard.' if self._booted
+            text = ('Screen off (idle timeout, same as a real Q2). Click the player or press any key to wake it.' if self._asleep
+                    else f'Running {name}. Click the screen, scroll the wheel, or use the keyboard.' if self._booted
                     else f'Booting {name}... (about 10 seconds)')
         elif r.state == 'off':
-            text = r.message + ' Press Power on to start it again.'
+            text = r.message + ' Press Power On to start it again.'
         else:
             text = r.message + (' ' + r.hint if r.hint else '')
         self.status.config(text=text, height=4 if r.state in ('error', 'stopped') and not self._notice else 2)
@@ -1109,10 +1115,10 @@ class EmulatorGUI:
             'stopped': '#e0584e', 'error': '#e0584e', 'busy': '#e0584e'}.get(r.state, controls.OFF))
         # Buttons follow the state
         on = r.state in ('running', 'loading')
-        self._power_btn.set(text='Power off' if on else 'Power on', tone='on' if on else '',
+        self._power_btn.set(text='Power Off' if on else 'Power On', tone='on' if on else '',
                             enabled=bool(on or self._firmware_to_start()),
-                            tip='Switch the player off' if on else 'Start the last firmware' if self._firmware_to_start()
-                            else 'Open a firmware first')
+                            tip='Turns the player off' if on else 'Starts the last firmware' if self._firmware_to_start()
+                            else 'Load a firmware first')
         self._restart_btn.set(enabled=r.state == 'running')
         if recording is None:
             self._rec_btn.set(icon='record', text='Record', tone='', tip='Record a video (F9)')
@@ -1120,7 +1126,7 @@ class EmulatorGUI:
             self._rec_btn.set(icon='stop', text=f'Stop {recording // 60}:{recording % 60:02d}', tone='rec',
                               tip='Stop and save the video (F9)')
         shown = self._firmware_to_start()
-        self._fw_btn.set(text=firmware_name(shown) if shown else 'Open a firmware file')
+        self._fw_btn.set(text=firmware_name(shown) if shown else 'Open Firmware')
         self.window.title('Shanling Q2 Emulator' + (f' - {name}' if name else ''))
         if r.state == 'running' and not self.overlay.is_open:
             self.canvas.focus_set()
@@ -1135,26 +1141,34 @@ class EmulatorGUI:
         work = self.runner.instructions()
         if work is not None and self._work_mark is None:
             self._work_mark = work
-        lines, over = [], False
+        width = self._layout_width or 300
+        memory = counted = None
+        words = []
         if used is not None:
-            total, top = round(used[0]), ', '.join(f'{name} {mb:.0f}' for name, mb in used[1][:3] if mb >= 1)
-            over = total > self.MEMORY_FULL
-            lines.append(f"Memory: {total} MB of the Q2's {Q2_RAM_MB} MB"
-                         + (' - more than a real Q2 has free: there, this would fail' if over else '')
-                         + (f', at most {round(peak[0])}' if peak and round(peak[0]) > total else '')
-                         + (f'   ({top})' if top else ''))
+            total = round(used[0])
+            largest = ', '.join(f'{name} {mb:.0f} MB' for name, mb in used[1][:3] if mb >= 1)
+            memory = (used[0], peak[0] if peak else used[0], self.MEMORY_FULL, Q2_RAM_MB, 'Largest: ' + largest if largest else '')
+            words.append(f'Memory: {total} MB of {Q2_RAM_MB} MB' + (" (over a real Q2's limit)" if total > self.MEMORY_FULL else '')
+                         + (f'   ({largest})' if largest else ''))
         if work is not None:
             since = max(0, work - self._work_mark)
-            lines.append(f'Work: {_count_words(since)} instructions since your last input '
-                         f"(at least {since / Q2_INSNS_PER_S:.1f} s of a Q2's processor), {_count_words(work)} since it started")
-        now = (tuple(lines), over)
+            last = (f'Last action: {_count_words(since)} instructions ({since / Q2_INSNS_PER_S:.1f} s or more on a real Q2)'
+                    if since >= 1_000_000 else 'Last action: none yet. Do something on the player.')
+            counted = (last, _count_words(work) + ' instructions')
+            words.append(f'{last} Total {_count_words(work)}')
+        now = (width, memory and (round(memory[0]), round(memory[1]), memory[4]), counted)
         if now == self._meter_shown:
             return
         self._meter_shown = now
-        if not lines:
+        if not words:
             return self.meter.grid_remove()
-        self.meter.config(fg='#e0584e' if over else self.DIM, text='\n'.join(lines))
-        self.meter.grid(row=2, column=0, sticky='ew', padx=31, pady=(0, 6))
+        self._meter_photo = self.ImageTk.PhotoImage(controls.monitor(width, memory, counted))
+        self.meter.config(image=self._meter_photo, text='\n'.join(words))   # (the words are what a test, or a screen reader, reads)
+        self.meter.grid(row=2, column=0, padx=(self._side or 12, self._side or 12), pady=(2, 8))
+
+    def _mark_work(self):
+        """An input: the work counted from here on is what it cost."""
+        self._work_mark = self.runner.instructions()
 
     def _memory_warning(self):
         """Nothing is stopped when the firmware takes more memory than a Q2 has: it is said, once each time
@@ -1167,17 +1181,12 @@ class EmulatorGUI:
         if used[0] > self.MEMORY_FULL and not self._over:
             self._over = True
             name, mb = used[1][0]
-            text = (f'The firmware is using {round(used[0])} MB. A real Q2 has 128 MB in all, about {self.MEMORY_FULL} MB of it '
-                    f'for its programs. The largest is {name}, with {round(mb)} MB. The emulator lets it run on; '
-                    'a real Q2 would likely stop it or fail here.')
-            self._say(f'More memory than a Q2 has: {round(used[0])} MB in use ({name} {round(mb)} MB).', 15)
-            self._note('More memory than a real Q2 has', text, seconds=14)
+            text = (f'In use: {round(used[0])} MB. A real Q2 has about {self.MEMORY_FULL} MB for apps. '
+                    f'Largest: {name} ({round(mb)} MB). The emulator keeps running; a real Q2 would likely fail here.')
+            self._say(f"Over a real Q2's memory: {round(used[0])} MB in use ({name} {round(mb)} MB).", 15)
+            self._note("Over a Real Q2's Memory", text, seconds=14)
         elif used[0] < self.MEMORY_FULL * 0.9:
             self._over = False
-
-    def _mark_work(self):
-        """An input: the work counted from here on is what it cost."""
-        self._work_mark = self.runner.instructions()
 
     def _firmware_to_start(self):
         return self.runner.firmware or self.last_firmware
@@ -1214,7 +1223,7 @@ class EmulatorGUI:
                 return self._captures
             except OSError:
                 self._captures = None
-        self._say("The captures folder couldn't be created. Pick one with More > Change the captures folder.")
+        self._say("Captures folder couldn't be created. Choose one in More > Change Captures Folder.")
         return None
 
     def _capture_path(self, ending):
@@ -1226,7 +1235,7 @@ class EmulatorGUI:
         if isinstance(shown, Exception):
             return self._say(f"The {what.lower()} couldn't be saved: {shown}", 12)
         self._say(f'{what} saved: {shown}', 8)
-        self._note(f'{what} saved', shown, ('Show in folder', lambda: self._reveal(path)))
+        self._note(f'{what} saved', shown, ('Show in Folder', lambda: self._reveal(path)))
 
     def _screenshot(self):
         path = self._capture_path('.png')
@@ -1520,7 +1529,7 @@ class EmulatorGUI:
     # -- Controls --
 
     def _busy_note(self):
-        self._say('Still loading; wait a moment for it to finish.', 4)
+        self._say('Still loading. Wait a moment.', 4)
 
     def _load_firmware(self, firmware_path, fresh=False, take_over=False):
         if not self.runner.load(firmware_path, strace=self.strace, fresh=fresh, take_over=take_over):
@@ -1553,22 +1562,22 @@ class EmulatorGUI:
     def _start_fresh(self):
         fw = self._firmware_to_start()
         if not fw:
-            return self._say('Open a firmware first.')
+            return self._say('Load a firmware first.')
         if self.runner.loading:
             return self._busy_note()
-        self._ask('Start this firmware fresh?',
-                  f'{firmware_name(fw)} will start like the very first time: the settings it saved '
-                  '(language, theme and the rest) are erased.\n\nYour firmware file and music are not touched.',
-                  'Start fresh', lambda: self._load_firmware(fw, fresh=True))
+        self._ask('Reset Firmware Settings?',
+                  f'{firmware_name(fw)} starts as on first boot. Its saved settings (language, theme and the rest) '
+                  'are erased.\n\nYour firmware file and music are not touched.',
+                  'Reset', lambda: self._load_firmware(fw, fresh=True))
 
     def _offer_take_over(self):
         r = self.runner
         r.state = 'error'  # asked once; answering No leaves the explanation on screen
         r.message, r.hint = ('Another emulator window is already running.',
                              'Close it, then press Power on.')
-        self._ask('Another emulator is running',
+        self._ask('Another Emulator Is Running',
                   'Another Q2 Emulator is already running, maybe in a window you closed or one that is hidden.',
-                  'Close it and start here', lambda: self._load_firmware(self._firmware_to_start(), take_over=True))
+                  'Close It and Start Here', lambda: self._load_firmware(self._firmware_to_start(), take_over=True))
 
     def _sd_label(self):
         sd = self.runner.sd_card
@@ -1581,11 +1590,11 @@ class EmulatorGUI:
         sd = self.runner.sd_card
         self.settings.set('sd_card', str(sd) if sd else None)
         if self.runner.state == 'running':
-            self._ask('SD card changed' if sd else 'SD card ejected',
-                      'The player looks for its card when it starts.' + (' Then open Folder on the player to see your music.' if sd else ''),
-                      'Restart the player', self._restart, 'Later')
+            self._ask('SD Card Changed' if sd else 'SD Card Ejected',
+                      'The player detects its SD card at startup.' + (' Then open Folder on the player to see your music.' if sd else ''),
+                      'Restart Now', self._restart, 'Later')
         elif sd:
-            self._say(f'SD card: {sd.name}. The player will find it when it starts.')
+            self._say(f'SD Card: {sd.name}. The player detects it at startup.')
 
     def _mount_sd(self):
         def chosen(path):
@@ -1613,15 +1622,15 @@ class EmulatorGUI:
             try:
                 self.door = agent_door.Door(self.runner, on_input=self._agent_input,
                                             player=lambda screen: player(screen, self.shell, backdrop=None))
-                self._say(f'AI agent control enabled (this computer only, port {self.door.port}). '
+                self._say(f'AI Agent Control: On (this computer only, port {self.door.port}). '
                           'Turn it off in More.', 12)
             except OSError as e:
                 self._agent_var.set(False)
-                self._say(f"AI agent control couldn't be enabled: {e}")
+                self._say(f"AI Agent Control couldn't start: {e}")
         elif not self._agent_var.get() and self.door:
             self.door.close()
             self.door = None
-            self._say('AI agent control disabled.', 5)
+            self._say('AI Agent Control: Off.', 5)
 
     def _toggle_internet(self):
         """The player's internet, on or off (wifi.py): it takes effect when the player next starts."""
@@ -1629,39 +1638,37 @@ class EmulatorGUI:
             return self._internet_set(False)
         if internet_tool():
             return self._internet_set(True)
-        self._say('Setting up the internet for the player (once, a few seconds)...', 60)
+        self._say('Setting up Internet (one time, a few seconds)...', 60)
         self._bg(get_internet_tool, lambda ok: self._internet_set(True) if ok is True else self._say(
-            "The internet couldn't be set up: the emulator's Linux needs the slirp4netns package, "
-            'and this PC needs to be online to fetch it.', 14))
+            "Internet couldn't be set up. This PC must be online the first time (it downloads one small package).", 14))
 
     def _toggle_measure(self):
         """Measuring mode on or off: the firmware's instructions are counted, from the player's next start."""
         on = self.runner.measure = not self.runner.measure
         self.settings.set('measure', on)
         self._work_mark = None
-        text = ('The emulator will count the instructions the firmware executes: how much work a thing takes, '
-                'which is the same on any PC and on a real Q2, where the time it takes here is not. '
-                'It shows under the status line. The player runs about a sixth slower meanwhile.'
-                if on else 'The firmware will run at its usual speed, uncounted.')
+        text = ('Counts the processor work each action takes (the same number on any PC and on a real Q2). '
+                'Shown under the status line. The player runs about 15% slower while this is on.'
+                if on else 'The player runs at normal speed again.')
         if self.runner.state == 'running':
-            self._ask('Measuring on' if on else 'Measuring off', text + '\n\nIt takes effect when the player restarts.',
-                      'Restart the player', self._restart, 'Later')
+            self._ask('Measuring Mode On' if on else 'Measuring Mode Off', text + '\n\nRestart the player to apply.',
+                      'Restart Now', self._restart, 'Later')
         else:
-            self._say("Measuring the player's work: " + ('on.' if on else 'off.'), 8)
+            self._say('Measuring Mode: ' + ('On.' if on else 'Off.'), 8)
 
     def _internet_set(self, on):
         self.runner.internet = on
         self.settings.set('internet', on)
         if self.runner.state == 'running':
-            self._ask('Internet on' if on else 'Internet off',
-                      ('The player will find one Wi-Fi network, "Emulator Wi-Fi", with this PC\'s internet behind it. '
-                       'Turn Wi-Fi on in the player and pick it; no password. What the player downloads is real.'
-                       if on else 'The player will have no network at all, as before.')
-                      + '\n\nIt takes effect when the player restarts.',
-                      'Restart the player', self._restart, 'Later')
+            self._ask('Internet On' if on else 'Internet Off',
+                      ('The player gets one Wi-Fi network, "Emulator Wi-Fi" (no password), using this PC\'s connection. '
+                       'In the player, turn Wi-Fi on and select it. Downloads are real.'
+                       if on else 'The player has no network.')
+                      + '\n\nRestart the player to apply.',
+                      'Restart Now', self._restart, 'Later')
         else:
-            self._say('Internet for the player: on. In the player, turn Wi-Fi on and pick "Emulator Wi-Fi".' if on
-                      else 'Internet for the player: off.', 10)
+            self._say('Internet: On. In the player, turn Wi-Fi on and select "Emulator Wi-Fi".' if on
+                      else 'Internet: Off.', 10)
 
     def _agent_input(self, kind, data):
         """From the agent's thread: only sets what _refresh draws (where the agent touched, what it pressed)."""
@@ -1685,7 +1692,7 @@ class EmulatorGUI:
         # mark closing, then wait for the loader to notice and stop what it started.
         self.runner.close()
         if self.runner.loading:
-            self.status.config(text='Closing once the firmware load finishes...')
+            self.status.config(text='Closing after the firmware finishes loading...')
             self.window.after(200, self._close)
             return
         if self._after:

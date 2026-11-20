@@ -161,8 +161,12 @@ def render(shape, size, icon, text, heading='', tone='', state='rest', enabled=T
         if enabled and tone == 'primary':
             face = {'rest': ACCENT, 'hover': ACCENT_HOVER, 'pressed': '#2a55a8'}[state]
         img.paste(PANEL, (0, 0, W, H))
-        d.rounded_rectangle((0, 0, W - 1, H - 1), 9 * SS, fill=face)
-        f = font(10 * SS)
+        if enabled and tone != 'primary':  # lighter than the panel, with an edge: plainly a button
+            face = {'rest': '#3a4a6e', 'hover': '#47598a', 'pressed': FACE_PRESSED}[state]
+            d.rounded_rectangle((0, 0, W - 1, H - 1), 9 * SS, fill=face, outline='#7f8fb5', width=SS)
+        else:
+            d.rounded_rectangle((0, 0, W - 1, H - 1), 9 * SS, fill=face)
+        f = font(11 * SS)
         d.text((W / 2, H / 2), _fit(d, text, f, W - 12 * SS), fill='#ffffff' if tone == 'primary' and enabled else ink,
                font=f, anchor='mm')
     elif shape == 'tile':
@@ -179,6 +183,43 @@ def render(shape, size, icon, text, heading='', tone='', state='rest', enabled=T
         f = font(11 * SS)
         d.text((left, H / 2 + 8 * SS), _fit(d, text, f, room), fill=ink, font=f, anchor='lm')
     return img.resize((w, h), Image.LANCZOS)
+
+
+def monitor(width, memory=None, work=None):
+    """The monitor under the status line, as one picture, width wide.
+    memory: (MB in use, the most it has been, MB a real Q2 has for its programs, MB a Q2 has in all,
+    'what holds the most'). work: ('the last action's cost', 'the total'), in measuring mode."""
+    height = (58 if memory else 0) + (40 if work else 0)
+    W, H = width * SS, max(1, height) * SS
+    img = Image.new('RGB', (W, H), BG)
+    d = ImageDraw.Draw(img)
+    y = 0
+    if memory:
+        used, peak, full, total, largest = memory
+        over = used > full
+        d.text((0, y + 8 * SS), 'MEMORY', fill=DIM, font=font(8 * SS, True), anchor='lm')
+        d.text((W, y + 8 * SS), f'{round(used)} MB of {total} MB', fill=RED_HOVER if over else INK, font=font(10 * SS, True), anchor='rm')
+        top, tall = y + 19 * SS, 10 * SS
+        d.rounded_rectangle((0, top, W - 1, top + tall), tall // 2, fill=FACE)
+        filled = int((W - 1) * min(used, total) / total)
+        if filled > tall:
+            d.rounded_rectangle((0, top, filled, top + tall), tall // 2, fill=RED if over else GREEN)
+        if peak > used:   # the most it has been: a thin mark
+            x = int((W - 1) * min(peak, total) / total)
+            d.line((x, top, x, top + tall), fill=DIM, width=SS)
+        x = int((W - 1) * full / total)   # where a real Q2 runs out
+        d.line((x, top - 3 * SS, x, top + tall + 3 * SS), fill=INK, width=SS)
+        d.text((0, y + 44 * SS), "Over a real Q2's limit. On the player this would likely fail." if over else largest,
+               fill=RED_HOVER if over else DIM, font=font(9 * SS), anchor='lm')
+        d.text((W, y + 44 * SS), f'Real Q2 limit {full} MB' + (f'   Peak {round(peak)} MB' if peak > used else ''),
+               fill=DIM, font=font(9 * SS), anchor='rm')
+        y += 58 * SS
+    if work:
+        last, all_of_it = work
+        d.text((0, y + 8 * SS), 'PROCESSOR WORK', fill=DIM, font=font(8 * SS, True), anchor='lm')
+        d.text((W, y + 8 * SS), f'Total {all_of_it}', fill=DIM, font=font(9 * SS), anchor='rm')
+        d.text((0, y + 26 * SS), last, fill=INK, font=font(10 * SS), anchor='lm')
+    return img.resize((width, max(1, height)), Image.LANCZOS)
 
 
 class Button:
@@ -363,20 +404,61 @@ class Overlay:
             self.tk.Label(grid, text=what, bg=PANEL, fg=DIM, font=('DejaVu Sans', 9), anchor='w', justify='left',
                           wraplength=room).grid(row=i, column=1, sticky='w', pady=1)
 
-    def row(self, text, command, checked=None, enabled=True, keep_open=False):
-        """A line to click. checked True/False shows a tick box; keep_open leaves the panel up (a tick)."""
-        mark = '' if checked is None else ('\u2611  ' if checked else '\u2610  ')
-        label = self.tk.Label(self.frame, text=mark + text, bg=PANEL, fg=INK if enabled else OFF, anchor='w',
-                              font=('DejaVu Sans', 10), padx=10, pady=5, cursor='hand2' if enabled else 'arrow')
-        label.pack(fill='x')
+    def _dot(self, on, bg):
+        """The on/off mark of a row: a ring, filled in its middle when on."""
+        size = 18
+        big = Image.new('RGB', (size * SS, size * SS), bg)
+        d = ImageDraw.Draw(big)
+        d.ellipse((SS, SS, (size - 1) * SS - 1, (size - 1) * SS - 1), outline=INK if on else DIM, width=2 * SS)
+        if on:
+            d.ellipse((5 * SS, 5 * SS, (size - 5) * SS - 1, (size - 5) * SS - 1), fill=GREEN)
+        photo = self.ImageTk.PhotoImage(big.resize((size, size), Image.LANCZOS))
+        self._keep.append(photo)
+        return photo
+
+    def row(self, text, command, checked=None, enabled=True, keep_open=False, danger=False):
+        """A line to click. checked True/False shows an on/off dot and the word; keep_open leaves the panel
+        up (a switch); danger turns the line red under the mouse (it removes something)."""
+        box = self.tk.Frame(self.frame, bg=PANEL, cursor='hand2' if enabled else 'arrow')
+        box.pack(fill='x')
+        parts, mark, dots = [box], None, None
+        if checked is not None:
+            dots = (self._dot(checked, PANEL), self._dot(checked, FACE_HOVER))
+            mark = self.tk.Label(box, image=dots[0], bg=PANEL, bd=0)
+            mark.pack(side='left', padx=(10, 0))
+            parts.append(mark)
+        label = self.tk.Label(box, text=text, bg=PANEL, fg=INK if enabled else OFF, anchor='w',
+                              font=('DejaVu Sans', 10), padx=10 if checked is None else 8, pady=5)
+        label.pack(side='left', fill='x', expand=True)
+        parts.append(label)
+        label.checked = checked
+        if checked is not None:
+            word = self.tk.Label(box, text='On' if checked else 'Off', bg=PANEL, fg=GREEN if checked else DIM,
+                                 font=('DejaVu Sans', 9, 'bold'), padx=10)
+            word.pack(side='right')
+            parts.append(word)
         if enabled:
             def click(event):
                 if not keep_open:
                     self.close()
                 command()
-            label.bind('<Enter>', lambda e: label.config(bg=FACE_HOVER))
-            label.bind('<Leave>', lambda e: label.config(bg=PANEL))
-            label.bind('<ButtonRelease-1>', click)
+
+            def paint(over):
+                bg = (RED if danger else FACE_HOVER) if over else PANEL
+                for part in parts:
+                    part.config(bg=bg)
+                if mark:
+                    mark.config(image=dots[1 if over else 0])
+                label.config(fg='#ffffff' if over and danger else INK)
+
+            def leave(event):  # only when the mouse has left the whole line, not gone from one part to the next
+                under = box.winfo_containing(event.x_root, event.y_root)
+                if under not in parts:
+                    paint(False)
+            for part in parts:
+                part.bind('<Enter>', lambda e: paint(True))
+                part.bind('<Leave>', leave)
+                part.bind('<ButtonRelease-1>', click)
         return label
 
     def choices(self, caption, names, current, colours, command):
@@ -407,7 +489,7 @@ class Overlay:
                 self.close()
                 if command:
                     command()
-            b = Button(self.tk, self.ImageTk, bar, 'plain', None, text, go, size=(max(84, 20 + 8 * len(text)), 32),
+            b = Button(self.tk, self.ImageTk, bar, 'plain', None, text, go, size=(max(96, 26 + 9 * len(text)), 36),
                        tone='primary' if primary else '')
             b.widget.pack(side='right', padx=(6, 0))
             made.append(b)
