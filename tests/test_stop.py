@@ -44,3 +44,20 @@ time.sleep(0.3)
 left = subprocess.run(['pgrep', '-f', f'{t}/tethered'], capture_output=True, text=True).stdout.split()
 print('PASS' if alive and p.poll() is not None and not left else 'FAIL',
       f'a firmware cannot outlive the program that started it: was running {bool(alive)}, leftovers after: {left}')
+# A card folder on the same file system as the rootfs (in the Linux home): os.path.ismount misses such a
+# mount; missed, the card was deleted with the rootfs. In a user namespace, where mounting needs no root.
+probe = f"""
+import os, pathlib, subprocess, sys
+sys.path.insert(0, {str(q2emu.HERE)!r}); import q2emu
+t = pathlib.Path({str(t)!r}); root = t/'rootfs2'; card = t/'card'
+(root/'mnt/mmc').mkdir(parents=True); (root/'proc').mkdir(); card.mkdir(); (card/'song.flac').write_bytes(b'music')
+for _ in range(3): subprocess.run(['mount', '--bind', str(card), str(root/'mnt/mmc')], check=True)   # stacked, as it was
+print('seen', q2emu.mounted(root/'mnt/mmc'), 'ismount', os.path.ismount(root/'mnt/mmc'))
+q2emu.remove_rootfs(root)
+print('rootfs gone', not root.exists(), 'song kept', (card/'song.flac').read_bytes() == b'music')
+"""
+out = subprocess.run(['unshare', '--user', '--map-root-user', '--mount', sys.executable, '-I', '-c', probe],
+                     capture_output=True, text=True)
+print('PASS' if 'seen True' in out.stdout and 'rootfs gone True song kept True' in out.stdout else 'FAIL',
+      'a card folder on the rootfs\'s own file system is seen as mounted and survives the rootfs being removed:',
+      out.stdout.strip().replace('\n', '; '), out.stderr.strip()[-200:])

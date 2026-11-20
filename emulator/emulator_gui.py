@@ -40,7 +40,7 @@ import agent_door
 import controls
 from device_view import DeviceView
 from q2emu import (
-    Q2, build_shim, lock, prepare, remove_rootfs, unpack, _patch_serial_check,
+    Q2, build_shim, lock, prepare, remove_rootfs, unmount, unpack, _patch_serial_check,
 )
 
 FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
@@ -386,8 +386,7 @@ def close_others(work):
             if _gone(pid, 3):
                 break
     mmc = work / 'rootfs/mnt/mmc'
-    if os.path.ismount(mmc):
-        subprocess.run(['umount', str(mmc)], capture_output=True)
+    unmount(mmc)
 
 
 def _gone(pid, seconds):

@@ -11,7 +11,7 @@ events to. Needs root, Linux, qemu-mipsel-static 11.1.3, squashfs-tools, clang a
 
 Script words: wait S | key NAME [MS] | wheel N | tap X Y | swipe X1 Y1 X2 Y2 [MS] | shot FILE
 (keys: centre return play next prev; coordinates are the upright screen's, 375x320)."""
-import argparse, fcntl, hashlib, os, pathlib, shlex, shutil, signal, socket, struct, subprocess, sys, tarfile, threading, time, zipfile
+import argparse, fcntl, hashlib, os, pathlib, re, shlex, shutil, signal, socket, struct, subprocess, sys, tarfile, threading, time, zipfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 XRES, YRES = 320, 375                      # the panel's own portrait frame; the screen is it turned upright
@@ -53,6 +53,9 @@ while :; do
     [ -x /etc/init.d/S11logo_display_shell ] && env "$p"=/lib/libq2emu.so /etc/init.d/S11logo_display_shell start
     /usr/bin/dbus-daemon --config-file=/etc/dbus-1/system.conf
     sleep 1
+    # A boot animation plays to its end before demo takes the screen, as S90play waits for it on a
+    # firmware that has one: its boot step keeps this flag while it plays (13 s at most).
+    i=0; while [ -e /tmp/q2-bootanim ] && [ $i -lt 130 ]; do sleep 0.1; i=$((i+1)); done
     (cd /tmp/q2emu/cores && LD_PRELOAD=/lib/libq2emu.so exec /release/bin/demo) &
     demo=$! booted=$(date +%s)
     while [ -z "$want" ]; do  # a trapped signal interrupts wait; demo ending returns from it
@@ -109,12 +112,32 @@ def lock(work):
     return f
 
 
+def mounted(path):
+    """Whether path is a mount point, by the kernel's own list. Not os.path.ismount: it compares device
+    numbers, so it misses a folder bind-mounted from the same file system (an SD card folder kept in the
+    Linux home). Missed, the card was mounted again over itself at every start, never unmounted, and
+    remove_rootfs deleted the user's music through it."""
+    want = os.path.realpath(path)
+    try:
+        with open('/proc/self/mountinfo') as f:  # field 5 is the mount point, its odd characters as \ooo
+            return any(re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), line.split()[4]) == want for line in f)
+    except OSError:
+        return os.path.ismount(path)
+
+
+def unmount(path):
+    """Unmount everything mounted at path (mounts stack). True when nothing is mounted there any more."""
+    for _ in range(16):
+        if not mounted(path): return True
+        if subprocess.run(['umount', str(path)], capture_output=True).returncode: break
+    return not mounted(path)
+
+
 def remove_rootfs(root):
     """Delete an unpacked rootfs, but never through a mount still inside it (mnt/mmc can be the user's own
     music folder, bind-mounted as the SD card)."""
     for m in 'proc', 'mnt/mmc':
-        if os.path.ismount(root/m): subprocess.run(['umount', str(root/m)], capture_output=True)
-        if os.path.ismount(root/m): raise RuntimeError(f'{root/m} is still mounted; unmount it and retry')
+        if not unmount(root/m): raise RuntimeError(f'{root/m} is still mounted; unmount it and retry')
     shutil.rmtree(root)
 
 
@@ -271,10 +294,10 @@ def prepare(root, sd, strace=False, qemu_env=''):
     # The SD card. The firmware sees a card only with all three: the hotplug flag /tmp/mmc_add, the slot's
     # block-device nodes, and /mnt/mmc being a mount point of its own (it compares st_dev with /mnt's).
     for p in SD_SLOT + ['tmp/mmc_add']: (root/p).unlink(missing_ok=True)
-    if os.path.ismount(root/'mnt/mmc'):  # left by a run that was killed: it may be another folder's
-        subprocess.run(['umount', str(root/'mnt/mmc')], capture_output=True)
+    # a mount left by a run that was killed may be another folder's: never one card over another
+    if not unmount(root/'mnt/mmc'): sys.exit(f"{root/'mnt/mmc'} is still mounted and could not be released")
     if sd:
-        if not os.path.ismount(root/'mnt/mmc'): run('mount', '--bind', sd, root/'mnt/mmc')
+        run('mount', '--bind', sd, root/'mnt/mmc')
         for p in SD_SLOT + ['tmp/mmc_add']: (root/p).write_bytes(b'')
     watchdog = root/WATCHDOG
     if watchdog.exists() and watchdog.read_text(errors='replace') != WATCHDOG_STANDIN:
@@ -346,8 +369,7 @@ class Q2:
         except OSError: pass
         for s in [*self.servers.values(), *(r for rs in self.readers.values() for r in rs)]:
             s.close()
-        if os.path.ismount(self.root/'mnt/mmc'):
-            subprocess.run(['umount', str(self.root/'mnt/mmc')], capture_output=True)
+        unmount(self.root/'mnt/mmc')
         try: BINFMT_RULE.write_text('-1')
         except OSError: pass
 
