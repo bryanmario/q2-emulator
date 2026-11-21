@@ -75,9 +75,9 @@ HELP = (  # More > Help: (heading, ((name, what it does), ...))
         ('Up, Down', 'Scroll'),
     )),
 )
-SD_HELP = ('Choose any folder with music in it (MP3, FLAC and the like; folders inside it are fine). The player '
-           'restarts and finds it as its SD card: open Folder on the player to browse and play it. Nothing is '
-           'copied. The player reads your folder itself, and may save small files of its own in it.')
+SD_HELP = ('Choose a folder with music (MP3, FLAC and similar). The player restarts and uses it as its SD card. '
+           'Open Folder on the player to browse it. Nothing is copied. The player may save a few small files '
+           'of its own in the folder.')
 
 
 def _sha256(path):
