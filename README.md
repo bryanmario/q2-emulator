@@ -41,10 +41,10 @@ Runs on Windows 10 and 11 with WSL 2, and offers to turn that on if it's missing
 
 <p align="center">
   <img src="docs/window.png" width="230" alt="The emulator window with a firmware running">
-  <img src="docs/window-more.png" width="230" alt="The More menu: shell colors, capture options, AI agent control">
-  <img src="docs/window-screen-off.png" width="230" alt="Recording while the player's screen is off">
+  <img src="docs/window-more.png" width="230" alt="The More menu: shell colors, capture options, Memory Meter, AI Agent Control, Internet, Measuring Mode">
+  <img src="docs/window-recording.png" width="230" alt="Recording a video of the player">
 </p>
-<p align="center"><em>The emulator window: a firmware running, the More menu, and recording while the player's screen is off.</em></p>
+<p align="center"><em>The emulator window: a firmware running, the More menu, and recording a video.</em></p>
 
 ## How close it is to a real Q2
 
