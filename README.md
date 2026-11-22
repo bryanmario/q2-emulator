@@ -56,7 +56,7 @@ True hardware emulation of the Q2 isn't possible yet. This is as close as it get
 | **Simulated** | Display, Touch, Wheel, Buttons, SD Card, Battery (always full), Wi-Fi (one network, through your PC's connection), Bluetooth (turns on, finds no devices). |
 | **Not Available** | Sound, Real Time Playback (a track opens in Now Playing but does not progress), Bluetooth and Wi-Fi Connections to real devices and networks, Charge/Discharge, or anything else that needs the hardware itself. |
 
-**Speed is not the same as on a real Q2.** The emulator runs on your PC, not on the Q2's chip. Menus and lists run faster here than on the player (2x or more). Some apps and games run slower (about 3x). So if something feels fast or slow here, it may not feel that way on the player.
+**Speed is not the same as on a real Q2.** The emulator runs on your PC, not on the Q2's chip. Menus and lists run faster here than on the player (2x or more). Some apps and games may run slower. So if something feels fast or slow here, it may not feel that way on the player.
 
 **What you can trust: Measuring Mode.** It counts how much work the player had to do for an action. That count is the same here and on a real Q2. If your change makes the count go up, it will be slower on the player. If the count goes down, it will be faster. Always confirm on the player.
 
