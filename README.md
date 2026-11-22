@@ -48,7 +48,7 @@ Runs on Windows 10 and 11 with WSL 2, and offers to turn that on if it's missing
 
 ## How close it is to a real Q2
 
-True hardware emulation of the Q2 isn't possible yet. This is as close as it gets, and here is exactly where it stops.
+True hardware emulation of the Q2 isn't possible yet. This is as close as it gets.
 
 | | |
 |---|---|
