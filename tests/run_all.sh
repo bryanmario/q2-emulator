@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 PY=/opt/q2-venv/bin/python3; [ -x $PY ] || PY=python3
 export DISPLAY=${DISPLAY:-:0}
 total_pass=0; total_fail=0
-for t in test_engine test_prebuilt_shim test_start_script test_stop test_watchdog test_window_states test_window_remembers test_video_timing test_captures test_agent_door; do
+for t in test_engine test_prebuilt_shim test_start_script test_stop test_watchdog test_window_states test_window_remembers test_video_timing test_captures test_agent_door test_drive_lock; do
   out=$(cd /tmp && timeout 300 $PY -I -B "$OLDPWD/$t.py" 2>&1)
   p=$(echo "$out" | grep -c '^PASS'); f=$(echo "$out" | grep -c '^FAIL')
   total_pass=$((total_pass + p)); total_fail=$((total_fail + f))

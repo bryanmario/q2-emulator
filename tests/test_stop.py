@@ -49,7 +49,7 @@ print('PASS' if alive and p.poll() is not None and not left else 'FAIL',
 probe = f"""
 import os, pathlib, subprocess, sys
 sys.path.insert(0, {str(q2emu.HERE)!r}); import q2emu
-t = pathlib.Path({str(t)!r}); root = t/'rootfs2'; card = t/'card'
+t = pathlib.Path({str(t)!r}); root = t/'w2'/'rootfs'; card = t/'card'   # (named rootfs: remove_tree deletes nothing else)
 (root/'mnt/mmc').mkdir(parents=True); (root/'proc').mkdir(); card.mkdir(); (card/'song.flac').write_bytes(b'music')
 for _ in range(3): subprocess.run(['mount', '--bind', str(card), str(root/'mnt/mmc')], check=True)   # stacked, as it was
 print('seen', q2emu.mounted(root/'mnt/mmc'), 'ismount', os.path.ismount(root/'mnt/mmc'))

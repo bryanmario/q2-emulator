@@ -7,11 +7,15 @@ apk update -q
 # ffmpeg: recording.  font-dejavu + fontconfig: the window's text.  slirp4netns: the player's internet.
 apk add -q python3 py3-pillow python3-tkinter tk squashfs-tools util-linux ffmpeg font-dejavu fontconfig slirp4netns
 fc-cache -f >/dev/null
+# The drive lock: WSL mounts the PC's drives read-only in this Linux (emulator/drives.py says why). The same
+# text as packaging/install.sh writes, which brings it to installs made before it.
 cat > /etc/wsl.conf <<'EOF'
 [user]
 default=root
 [interop]
 appendWindowsPath=false
+[automount]
+options = "ro"
 EOF
 rm -rf /var/cache/apk/*
 echo "private Linux ready: $(cat /etc/alpine-release), $(du -sh / -x 2>/dev/null | cut -f1)"

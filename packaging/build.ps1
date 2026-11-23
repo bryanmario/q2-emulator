@@ -65,6 +65,7 @@ Copy-Item "$Project\emulator\*.py", "$Project\emulator\shim.c", "$Project\emulat
 Copy-Item "$Project\bin\qemu-mipsel-static" "$app\bin"
 if (Test-Path "$Project\bin\count\q2count-run") { Copy-Item -Recurse "$Project\bin\count" "$app\bin\count" }  # the measuring mode (tools/build_count.sh)
 Copy-Item "$Project\LICENSE" $app
+Copy-Item "$Project\packaging\install.sh" $app   # the launcher's install step: the copy and the drive lock
 Copy-Item "$Project\docs\THIRD-PARTY.md" $app   # what the download bundles, and under which licenses
 $hashes = Get-ChildItem $app -Recurse -File | Sort-Object FullName | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash }
 $sha = [Security.Cryptography.SHA256]::Create()

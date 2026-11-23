@@ -100,13 +100,16 @@ static class Launcher
             Dictionary<string, string> env = new Dictionary<string, string>();
             env["Q2APP"] = Path.Combine(Data, "app");
             string output;
-            int result = Wsl("-d " + Distro + " -u root -e sh -c \"rm -rf /opt/q2-emulator && mkdir -p /opt && "
-                             + "cp -r \\\"$Q2APP\\\" /opt/q2-emulator && chmod +x /opt/q2-emulator/bin/qemu-mipsel-static && "
-                             // the taskbar icon: WSL's display takes it from a desktop entry (emulator/q2emulator.desktop)
-                             + "mkdir -p /usr/share/applications /usr/share/pixmaps && "
-                             + "cp /opt/q2-emulator/emulator/icon.png /usr/share/pixmaps/q2emulator.png && "
-                             + "cp /opt/q2-emulator/emulator/q2emulator.desktop /usr/share/applications/q2emulator.desktop\"",
+            // install.sh (in the app): the copy into /opt/q2-emulator, and the drive lock (the PC's drives
+            // read-only in the box). It answers 3 when the drives are still mounted writable, from before
+            // the lock: this Linux is restarted so that the emulator only ever starts with them locked.
+            int result = Wsl("-d " + Distro + " -u root -e sh -c \"exec sh \\\"$Q2APP/install.sh\\\" \\\"$Q2APP\\\"\"",
                              env, out output);
+            if (result == 3)
+            {
+                string ignored;
+                result = Wsl("--terminate " + Distro, null, out ignored);
+            }
             if (result != 0)
             {
                 CloseSplash();

@@ -38,6 +38,7 @@ from simulator_device import (
 )
 import agent_door
 import controls
+import drives
 from device_view import DeviceView
 from q2emu import (
     Q2, Q2_INSNS_PER_S, Q2_RAM_MB, build_shim, can_count, lock, prepare, remove_rootfs, unmount, unpack, _patch_serial_check,
@@ -1199,12 +1200,10 @@ class EmulatorGUI:
         saved = self.settings.get('captures')
         folder = pathlib.Path(saved) if saved else default_captures_dir()
         for choice in (folder, pathlib.Path.home() / 'Q2 Emulator'):
-            try:
-                choice.mkdir(parents=True, exist_ok=True)
+            # on a locked drive (drives.py) Windows makes the folder, and that one folder is made writable
+            if drives.make_folder(choice) and drives.writable(choice):
                 _hand_over(choice)
                 return choice
-            except OSError:
-                continue
         return None
 
     def _captures_found(self, folder):
@@ -1218,11 +1217,9 @@ class EmulatorGUI:
         if not self._captures:
             self._captures_found(self._find_captures())
         if self._captures:
-            try:
-                self._captures.mkdir(parents=True, exist_ok=True)
+            if drives.make_folder(self._captures) and drives.writable(self._captures):
                 return self._captures
-            except OSError:
-                self._captures = None
+            self._captures = None
         self._say("Captures folder couldn't be created. Choose one in More > Change Captures Folder.")
         return None
 
@@ -1350,8 +1347,10 @@ class EmulatorGUI:
 
     def _choose_captures(self):
         def chosen(path):
+            old = self._captures
             self._captures = pathlib.Path(path)
             self.settings.set('captures', path)
+            if old and old != self._captures and old != self.runner.sd_card: drives.release(old)  # locked again
             self._bg(lambda: shown_path(path), lambda shown: self._say(f'Captures will be saved in: {shown}'))
         self._pick('folder', 'Where should screenshots and videos be saved?', self.settings.get('captures'), chosen)
 
@@ -1585,9 +1584,10 @@ class EmulatorGUI:
                          tip=f'{sd}\nClick to choose another folder' if sd
                          else 'Choose a music folder to use as the SD card')
 
-    def _sd_changed(self):
+    def _sd_changed(self, old=None):
         self._sd_label()
         sd = self.runner.sd_card
+        if old and old != sd and old != self._captures: drives.release(old)  # the card before: locked again
         self.settings.set('sd_card', str(sd) if sd else None)
         if self.runner.state == 'running':
             self._ask('SD Card Changed' if sd else 'SD Card Ejected',
@@ -1598,15 +1598,15 @@ class EmulatorGUI:
 
     def _mount_sd(self):
         def chosen(path):
-            self.runner.sd_card = pathlib.Path(path)
-            self._sd_changed()
+            old, self.runner.sd_card = self.runner.sd_card, pathlib.Path(path)
+            self._sd_changed(old)
         sd = self.runner.sd_card
         self._pick('folder', 'Choose a music folder to use as the SD card', str(sd) if sd else None, chosen)
 
     def _eject_sd(self):
         if self.runner.sd_card:
-            self.runner.sd_card = None
-            self._sd_changed()
+            old, self.runner.sd_card = self.runner.sd_card, None
+            self._sd_changed(old)
 
     def _pick_shell(self, name):
         self._shell_var.set(name)

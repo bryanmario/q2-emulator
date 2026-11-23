@@ -14,6 +14,8 @@ Script words: wait S | key NAME [MS] | wheel N | tap X Y | swipe X1 Y1 X2 Y2 [MS
 import argparse, fcntl, hashlib, mmap, os, pathlib, re, shlex, shutil, signal, socket, struct, subprocess, sys, tarfile, threading, time, zipfile
 
 HERE = pathlib.Path(__file__).resolve().parent
+if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
+import drives  # the drive lock (drives.py)
 XRES, YRES = 320, 375                      # the panel's own portrait frame; the screen is it turned upright
 EVENT = struct.Struct('<iiHHi')            # struct input_event, MIPS32
 EV_SYN, EV_KEY, EV_ABS, ABS_X, ABS_Y, ABS_PRESSURE, BTN_TOUCH = 0, 1, 3, 0, 1, 0x18, 0x14a
@@ -139,6 +141,7 @@ def original(root, name):
         kept.rename(path)
 
 
+CARD = [None]  # the card folder prepare() last made writable; Q2.stop() locks it again
 SD_SLOT =['dev/mmcblk4'] + [f'dev/mmcblk4p{i}' for i in range(10)]  # the Q2's card slot, as the firmware looks for it
 BINFMT_RULE = pathlib.Path('/proc/sys/fs/binfmt_misc/q2mipsel')
 
@@ -180,12 +183,31 @@ def unmount(path):
     return not mounted(path)
 
 
+def remove_tree(path, name):
+    """Delete a folder the emulator made itself, after checking it is that folder and nothing else: its
+    name must be the one expected, it must be at least three levels below /, and it must hold no mount (an
+    SD card, a Windows folder) and lie on no Windows drive. Anything else is refused, never deleted."""
+    raw = str(path)
+    p = pathlib.Path(os.path.realpath(raw)) if raw.strip() else None
+    if p is None or p.name != name or len(p.parts) < 4:
+        raise RuntimeError(f'refusing to delete {raw!r}: not the emulator\'s own {name} folder')
+    if not p.exists(): return
+    if p.is_symlink() or not p.is_dir():
+        raise RuntimeError(f'refusing to delete {p}: not a plain folder')
+    if drives.on_windows(p):
+        raise RuntimeError(f'refusing to delete {p}: it is on a Windows drive')
+    inside = [m[0] for m in drives.mounts() if m[0] == str(p) or m[0].startswith(str(p) + '/')]
+    if inside:
+        raise RuntimeError(f'refusing to delete {p}: {inside[0]} is mounted inside it')
+    shutil.rmtree(p)
+
+
 def remove_rootfs(root):
     """Delete an unpacked rootfs, but never through a mount still inside it (mnt/mmc can be the user's own
     music folder, bind-mounted as the SD card)."""
     for m in 'proc', 'mnt/mmc':
         if not unmount(root/m): raise RuntimeError(f'{root/m} is still mounted; unmount it and retry')
-    shutil.rmtree(root)
+    remove_tree(root, 'rootfs')
 
 
 def symbol(elf, name):
@@ -328,13 +350,13 @@ def prepare(root, sd, strace=False, qemu_env='', internet=False, count=False):
     # Measuring mode: the firmware's programs run under the counting QEMU (see COUNT), which lives in the
     # box as /q2emu-host with its libraries; the kernel starts each through its small launcher.
     host = root/'q2emu-host'
-    if host.exists(): shutil.rmtree(host)
+    remove_tree(host, 'q2emu-host')
     if count:
         shutil.copytree(COUNT, host)
         for f in [*host.iterdir(), COUNT/'q2count-run']: f.chmod(0o755)
         qemu = str(COUNT/'q2count-run')
     work = root/'tmp/q2emu/work'
-    if work.exists(): shutil.rmtree(work)
+    remove_tree(work, 'work')
     work.mkdir(parents=True)
     misc = BINFMT_RULE.parent
     if not (misc/'register').exists(): run('mount', '-t', 'binfmt_misc', 'binfmt_misc', misc)
@@ -365,6 +387,9 @@ def prepare(root, sd, strace=False, qemu_env='', internet=False, count=False):
     # a mount left by a run that was killed may be another folder's: never one card over another
     if not unmount(root/'mnt/mmc'): sys.exit(f"{root/'mnt/mmc'} is still mounted and could not be released")
     if sd:
+        # the card's own folder writable, though its drive is locked (drives.py); the player writes to its card
+        CARD[0] = sd
+        if not drives.writable(sd): print(f'q2emu: the SD card {sd} can only be read: the player cannot write to it', file=sys.stderr)
         run('mount', '--bind', sd, root/'mnt/mmc')
         for p in SD_SLOT + ['tmp/mmc_add']: (root/p).write_bytes(b'')
     watchdog = root/WATCHDOG
@@ -626,6 +651,7 @@ class Q2:
             try: fb.close()
             except (OSError, ValueError, BufferError): pass
         unmount(self.root/'mnt/mmc')
+        drives.release(CARD[0])  # the card's folder read-only again, as its drive is (drives.py)
         try: BINFMT_RULE.write_text('-1')
         except OSError: pass
 

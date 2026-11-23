@@ -28,8 +28,10 @@ if you change `shim.c`. It also needs QEMU's `qemu-mipsel-static`, version 11.1.
   the launcher that starts each program under it. `tools/build_count.sh` builds them, with a second QEMU
   (the same 11.1.3, source unchanged, built with plugins), into `bin/count/`
 - `emulator/agent_door.py`, `emulator/agent_mcp.py` AI agent control (below)
+- `emulator/drives.py` the drive lock (below)
 - `packaging/` builds the Windows download (`build.ps1`): one file, `Q2Emulator.exe`, which unpacks a `data`
-  folder beside itself. `Q2Emulator.exe --uninstall` removes it from a PC.
+  folder beside itself. `Q2Emulator.exe --uninstall` removes it from a PC. `packaging/install.sh` is the
+  launcher's install step: it copies the app into the private Linux and writes the drive lock.
 - `tests/` the checks; the firmware binaries some of them use are not in git (`tests/fixtures/README.md`)
 
 ## AI agent control
@@ -48,6 +50,18 @@ The connector is an MCP server. Register it with your agent as:
 
 Tools: `status`, `load_firmware`, `screenshot`, `tap`, `swipe`, `key`, `wheel`, `wait`, `power`, `restart`,
 `steps`, `firmware_log`. The same control speaks plain HTTP for scripts: see the top of `emulator/agent_door.py`.
+
+## The drive lock
+
+In the Windows download's private Linux, the PC's drives (`/mnt/c`, `/mnt/e`, ...) are mounted read-only
+(`[automount] options = "ro"` in `/etc/wsl.conf`): nothing that runs in it can change or delete a Windows
+file. Two folders are made writable again, each on its own and only while needed: the folder picked as the
+SD card, while the player runs, and the folder screenshots and recordings are saved in (`emulator/drives.py`).
+Installs from before 1.3 get the lock at their first start after the update (`packaging/install.sh`, then
+WSL restarts that one Linux). The emulator's own deletes (`remove_tree` in `q2emu.py`) only ever delete
+its own folders, by name, and refuse anything on a Windows drive or with a mount inside.
+
+Run from source in your own WSL, nothing changes: your drives stay as they are mounted.
 
 ## What the emulator changes, and what it leaves alone
 
